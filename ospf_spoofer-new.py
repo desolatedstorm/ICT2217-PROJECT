@@ -24,6 +24,7 @@ A reaches Full once LSDB sync is complete.
 
 Only after LSAs are accepted into the LSDB does SPF use their metrics.
 """
+import typing
 import logging
 import threading
 import time
@@ -249,8 +250,17 @@ self.config.area,
 
             if ospf.type == OSPFType.HELLO:
                 self.handle_hello(nb, ospf)
+            elif ospf.type == OSPFType.DBD:
+                self.handle_dbd(nb, ospf)
+            elif ospf.type == OSPFType.LSR:
+                self.handle_lsreq(nb, ospf)
+            elif ospf.type == OSPFType.LSU:
+                self.handle_lsupd(nb, ospf)
+            elif ospf.type == OSPFType.LSACK:
+                self.handle_lsack(nb, ospf)
 
     def get_or_create_neighbour(self, pkt: Any) -> Neighbour:
+        """Get Neighbour List and Adds Neighbour to List if not already added"""
         ospf = pkt[OSPF_Hdr]
         router_id = str(ospf.src)
         ip = pkt[IP].src
@@ -274,6 +284,7 @@ self.config.area,
         return nb
 
     def handle_hello(self, nb: Neighbour, ospf: Any) -> None:
+        """OSPF HELLO Packet Handler"""
         ospf_hello = ospf[OSPF_Hello]
 
         # Update OSPF Hello state from DOWN to INIT
@@ -287,16 +298,136 @@ self.config.area,
             if nb.state in {NeighbourState.DOWN, NeighbourState.INIT}:
                 nb.set_state(NeighbourState.TWO_WAY)
 
-        # Form adjacency if neighbour state is two way & my router id is in neighbour OSPF Hello
+        # Form adjacency if 
         if nb.state == NeighbourState.TWO_WAY and self.should_form_adjacency(nb, ospf_hello):
             self.start_exstart(nb)
 
     def should_form_adjacency(self, nb: Neighbour, ospf_hello: OSPF_Hello) -> bool:
-        # if self.config.
-        pass
+        """Form adjacency only if router is DR/BDR"""
+        nb_is_dr = str(ospf_hello.router) == nb.router_id
+        nb_is_bdr = str(ospf_hello.router) == nb.router_id
+        # Initialising - No DR set yet
+        no_dr_declared = str(ospf_hello.router) == nb.router_id
 
-    def start_exstart(self):
-        pass
+        return nb_is_dr or nb_is_bdr or no_dr_declared
+
+    ### ------ DBD NEGOTIATION ------ ###
+    def start_exstart(self, nb: Neighbour) -> None:
+        """Begins DBD Negotiation - Decide DBD master slave"""
+        if nb.mac is None:
+            LOG.warning("[!] Cannot start ExStart with %s: no MAC address.", nb.router_id)
+            return
+
+        nb.set_state(NeighbourState.EXSTART)
+        nb.master = None
+        nb.dd_seq = int(time.time()) & 0xFFFF
+
+        dbd_packet = self.build_dbd_packet(
+                master=True,
+                init=True,
+                more=True,
+                dd_seq=nb.dd_seq,
+                lsa_headers=[],
+                )
+
+        self._send_ospf(
+                dst_ip=nb.ip,
+                dst_mac=nb.mac,
+                ospf_type=OSPFType.DBD,
+                payload=dbd_packet,
+                )
+
+    def build_dbd_packet(
+            self,
+            master: bool,
+            init: bool,
+            more: bool,
+            dd_seq: int,
+            lsa_headers: list[Any]
+            ) -> Packet:
+        """DBD Packet Builder"""
+        flags = []
+
+        if init:
+            flags.append("I")
+        if more:
+            flags.append("M")
+        if master:
+            flags.append("MS")
+
+        return OSPF_DBDesc(
+                mtu=self.config.mtu,
+                options=self.config.options,
+                dbdescr=flags,
+                ddseq=dd_seq,
+                lsaheaders=lsa_headers,
+                )
+    
+    def handle_dbd(self, nb: Neighbour, ospf: Any) -> None:
+        """Handler for received OSPF DBD Type Packet"""
+        dbd_packet = ospf[OSPF_DBDesc]
+        # Retrieve flags field from `OSPF_DBDesc` type
+        flags = set(dbd_packet.dbdescr)
+
+        # Ensure neighbour state not DOWN, INIT or TWO_WAY
+        if nb.state in {NeighbourState.DOWN, NeighbourState.INIT, NeighbourState.TWO_WAY}:
+            return
+
+        # Establish master/slave relationship (router with highest id)
+        if nb.state == NeighbourState.EXSTART:
+            self.handle_exstart_dbd(nb, dbd_packet, flags)
+            return
+
+        # Exchange headers/summaries of Link State Database
+        if nb.state == NeighbourState.EXCHANGE:
+            self.handle_exchange_dbd(nb, dbd_packet, flags)
+
+        # Get full details of missing/outdated routes
+        if nb.state == NeighbourState.LOADING:
+            self.handle_loading_dbd(nb, dbd_packet, flags)
+
+    def handle_exstart_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: set[str]) -> None:
+        """Handler to establish master/slave relationship"""
+        # Neighbour proposes itself as master
+        nb_proposes_master = { "I", "M", "MS" } <= flags and not dbd_packet.lsaheaders
+
+        if nb_proposes_master and nb.master is None:
+            # Neighbour has larger router id - wins master role
+            if nb.router_id > self.config.router_id:
+                nb.master = False
+                nb.dd_seq = dbd_packet.ddseq
+
+                reply_packet = self.build_dbd_packet(
+                        master=False,
+                        init=False,
+                        more=False,
+                        dd_seq=typing.cast(int, nb.dd_seq),
+                        lsa_headers=[],
+                        )
+
+                self._send_ospf(
+                        dst_ip=nb.ip,
+                        dst_mac=typing.cast(str, nb.mac), 
+                        ospf_type=OSPFType.DBD,
+                        payload=reply_packet,
+                        )
+
+            # Otherwise drop packet
+            return
+
+        # Neighbour accepts us as master - confirm ddseq number same as our tracked dd_seq number
+        nb_yeilded = "MS" not in flags and dbd_packet.ddseq == nb.dd_seq
+
+        if nb_yeilded:
+            nb.master = True
+            self.collect_lsa_headers(nb, dbd.lsaheaders)
+            nb.set_state(NeighbourState.EXCHANGE)
+
+            self.continue_dbd_exchange(nb, more=("M" in flags))
+
+        
+
+    ### ------ END DBD NEGOIATION ------ ###
 
 
     def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
