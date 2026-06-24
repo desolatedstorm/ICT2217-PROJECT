@@ -29,7 +29,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum, auto
+from enum import Enum, IntEnum, auto, StrEnum
 from typing import Any
 
 from scapy.all import Packet, get_if_hwaddr, get_if_addr, sendp, sniff
@@ -75,6 +75,12 @@ class OSPFType(IntEnum):
     LSACK = 5
 
 
+class DBDFlags(StrEnum):
+    INIT = "I"
+    MORE = "M"
+    MASTER = "MS"
+
+
 @dataclass
 class OSPFConfig:
     iface: str
@@ -101,8 +107,8 @@ class Neighbour:
     master: bool | None = None
     dd_seq: int | None = None
 
-    pending_requests: list = field(default_factory=list)
-    neighbour_headers: list = field(default_factory=list)
+    pending_requests: list[tuple[int, str, str]] = field(default_factory=list)
+    neighbour_headers: list[Any] = field(default_factory=list)
 
     last_seen: float = field(default_factory=time.time)
 
@@ -349,11 +355,11 @@ self.config.area,
         flags = []
 
         if init:
-            flags.append("I")
+            flags.append(DBDFlags.INIT)
         if more:
-            flags.append("M")
+            flags.append(DBDFlags.MORE)
         if master:
-            flags.append("MS")
+            flags.append(DBDFlags.MASTER)
 
         return OSPF_DBDesc(
                 mtu=self.config.mtu,
@@ -389,7 +395,7 @@ self.config.area,
     def handle_exstart_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: set[str]) -> None:
         """Handler to establish master/slave relationship"""
         # Neighbour proposes itself as master
-        nb_proposes_master = { "I", "M", "MS" } <= flags and not dbd_packet.lsaheaders
+        nb_proposes_master = { DBDFlags.INIT, DBDFlags.MORE, DBDFlags.MASTER } <= flags and not dbd_packet.lsaheaders
 
         if nb_proposes_master and nb.master is None:
             # Neighbour has larger router id - wins master role
@@ -411,26 +417,186 @@ self.config.area,
                         ospf_type=OSPFType.DBD,
                         payload=reply_packet,
                         )
+                nb.set_state(NeighbourState.EXCHANGE)
 
             # Otherwise drop packet
             return
 
         # Neighbour accepts us as master - confirm ddseq number same as our tracked dd_seq number
-        nb_yeilded = "MS" not in flags and dbd_packet.ddseq == nb.dd_seq
+        nb_yeilded = DBDFlags.MASTER not in flags and dbd_packet.ddseq == nb.dd_seq
 
         if nb_yeilded:
             nb.master = True
-            self.collect_lsa_headers(nb, dbd.lsaheaders)
+            self.collect_lsa_headers(nb, dbd_packet.lsaheaders)
             nb.set_state(NeighbourState.EXCHANGE)
 
-            self.continue_dbd_exchange(nb, more=("M" in flags))
+            self.continue_dbd_exchange(nb, more=(DBDFlags.MORE in flags))
+    
+    def handle_exchange_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: set[str]) -> None:
+        """Handler for OSPF DBD EXCHANGE STATE packet exchange"""
+        self.collect_lsa_headers(nb, dbd_packet.lsaheaders)
 
-        
+        if nb.master is False:
+            # Update neighbour tracker to received seq num
+            nb.dd_seq = dbd_packet.ddseq
 
+            reply = self.build_dbd_packet(
+                    master=False,
+                    init=False,
+                    more=False,
+                    dd_seq=typing.cast(int, nb.dd_seq),
+                    lsa_headers=[],
+                    )
+
+            self._send_ospf(
+                    dst_ip=nb.ip,
+                    dst_mac=typing.cast(str, nb.mac),
+                    ospf_type=OSPFType.DBD,
+                    payload=reply,
+                    )
+            
+            # More data waiting to be sent?
+            if DBDFlags.MORE not in flags:
+                self.exchange_complete(nb)
+
+        elif nb.master is True:
+            if dbd_packet.ddseq != nb.dd_seq:
+                return
+
+            self.continue_dbd_exchange(nb, more=(DBDFlags.MORE in flags))
+
+    def continue_dbd_exchange(self, nb: Neighbour, more: bool) -> None:
+        if more:
+            nb_ddseq = typing.cast(int, nb.dd_seq)
+            nb_ddseq += 1
+
+            dbd_packet = self.build_dbd_packet(
+                    master=True,
+                    init=False,
+                    more=False,
+                    dd_seq=nb_ddseq,
+                    lsa_headers=[],
+                    )
+            self._send_ospf(nb.ip, typing.cast(str, nb.mac), OSPFType.DBD, dbd_packet)
+        else:
+            self.exchange_complete(nb)
+
+    def collect_lsa_headers(self, nb: Neighbour, lsaheaders: list[Any]) -> None:
+        """Collects DBD LSA Headers and append to Unknown LSA's to Neighbour's `neighbour_headers` list"""
+        for header in lsaheaders:
+            key = (header.type, str(header.id), str(header.adrouter))
+
+            if key in self.lsdb:
+                continue
+
+            already_known = any(
+                    (hdr.type, str(hdr.id), str(hdr.adrouter)) == key
+                    for hdr in nb.neighbour_headers
+                    )
+
+            if not already_known:
+                nb.neighbour_headers.append(header)
     ### ------ END DBD NEGOIATION ------ ###
 
+    ### ------ REQUEST MISSING LSAs ------ ###
+    def exchange_complete(self, nb: Neighbour) -> None:
+        """Requests missing LSAs, after DBD exchange is done"""
+        if nb.neighbour_headers:
+            nb.set_state(NeighbourState.LOADING)
+            self.send_next_lsreq_batch(nb)
+        else:
+            nb.set_state(NeighbourState.FULL)
+            LOG.info("Neighbour %s state set to FULL", nb.router_id)
+
+    def send_next_lsreq_batch(self, nb:Neighbour) -> None:
+        # No LSA to send - Proceed to FULL state
+        if not nb.neighbour_headers:
+            nb.set_state(NeighbourState.FULL)
+            LOG.info("Reached FULL state with neighbour %s", nb.router_id)
+            return
+
+        lsreq_items = []
+
+        for hdr in nb.neighbour_headers:
+            lsreq = OSPF_LSReq_Item(
+                    type=hdr.type,
+                    id=hdr.id,
+                    adrouter=hdr.adrouter,
+                    )
+            
+            lsreq_items.append(lsreq)
+
+        nb.pending_requests = []
+
+        for hdr in nb.neighbour_headers:
+            key = (hdr.type, str(hdr.id), str(hdr.adrouter))
+            nb.pending_requests.append(key)
+
+        # Craft LSR payload
+        lsreq = OSPF_LSReq(requests=lsreq_items)
+
+        self._send_ospf(
+                dst_ip=nb.ip,
+                dst_mac=typing.cast(str, nb.mac),
+                ospf_type=OSPFType.LSR,
+                payload=lsreq
+                )
+
+    def handle_lsupd(self, nb:Neighbour, ospf_packet: Any) -> None:
+        """Received full LSA and stores them"""
+        lsupd = ospf_packet[OSPF_LSUpd]
+        received_lsas = []
+
+        for lsa in lsupd.lsalist:
+            key = (lsa.type, str(lsa.id), str(lsa.adrouter))
+
+            self.lsdb[key] = lsa
+            received_lsas.append(lsa)
+
+            # Repopulate neighbour_headers list without received key
+            nb.neighbour_headers = [
+                    hdr for hdr in nb.neighbour_headers
+                    if (hdr.type, str(hdr.id), str(hdr.adrouter)) != key
+                    ]
+
+            # Repopulate pending_requests list without received req
+            nb.pending_requests = [
+                    req for req in nb.pending_requests
+                    if req != key
+                    ]
+        if received_lsas:
+            self.send_lsa_ack(nb, received_lsas)
+
+        if nb.state == NeighbourState.LOADING and not nb.pending_requests:
+            self.send_next_lsreq_batch(nb)
+
+    def send_lsa_ack(self, nb: Neighbour, lsas: list[Any]) -> None:
+        """Send LSA Ack"""
+        headers = [
+                OSPF_LSA_Hdr(
+                    age=lsa.age,
+                    options=lsa.options,
+                    type=lsa.type,
+                    id=lsa.id,
+                    adrouter=lsa.adrouter,
+                    seq=lsa.seq,
+                    chksum=lsa.chksum,
+                    len=lsa.len,
+                    )
+                for lsa in lsas
+                ]
+
+        ack = OSPF_LSAck(lsaheaders=headers)
+
+        self._send_ospf(
+                dst_ip=nb.ip,
+                dst_mac=typing.cast(str, nb.mac),
+                ospf_type=OSPFType.LSACK,
+                payload=ack,
+                )
 
     def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
+        """Sends OSPF Packets"""
         pkt = (
                 Ether(src=self.src_mac, dst=dst_mac) /
                 IP(src=self.src_ip, dst=dst_ip, proto=89, ttl=1) /
