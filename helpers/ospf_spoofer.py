@@ -24,6 +24,8 @@ A reaches Full once LSDB sync is complete.
 
 Only after LSAs are accepted into the LSDB does SPF use their metrics.
 """
+from curses import keyname
+from scapy.contrib.gtp import TrueFalse_value
 import typing
 import logging
 import threading
@@ -94,6 +96,8 @@ class OSPFConfig:
     priority: int = 0 #TODO: MUST CHANGE PRIORITY - 0 means not participating in OSPF election
     options: int = 0x02
     mtu: int = 1500
+    rxmt_interval: int = 5 # retransmission interval
+    max_retries: int = 3
 
 
 @dataclass
@@ -108,6 +112,8 @@ class Neighbour:
     dd_seq: int | None = None
 
     pending_requests: list[tuple[int, str, str]] = field(default_factory=list)
+    pending_acks: dict[tuple[int, str, str], dict[str, Any]] = field(default_factory=dict)
+
     neighbour_headers: list[Any] = field(default_factory=list)
 
     last_seen: float = field(default_factory=time.time)
@@ -159,6 +165,7 @@ self.config.area,
                 )
 
         self.start_hello_loop()
+        self.start_retransmission_loop()
 
         try:
             self.start_sniffer()
@@ -190,6 +197,8 @@ self.config.area,
                     payload=hello,
                     )
 
+            time.sleep(self.config.hello_interval)
+
     def expire_dead_neighbours(self, now: float) -> None:
         """Checks if neighbour links are dead, then removes them from neighbours list"""
         dead = [
@@ -220,9 +229,37 @@ self.config.area,
             deadinterval=self.config.dead_interval,
             router=self.src_ip,   # DR
             backup="0.0.0.0",   # BDR TODO: need backup? if so what value to use?
-            neighbours=neighbour_ids,
+            neighbors=neighbour_ids,
         )
     ### ------ OSPF HELLO ENDS ------ ###
+
+    ### ----- Retransmission Loop ------ ###
+    def start_retransmission_loop(self) -> threading.Thread:
+        thread = threading.Thread(target=self._retransmission_loop, daemon=True)
+        thread.start()
+        return thread
+
+    def _retransmission_loop(self) -> None:
+        while self.running:
+            now = time.time()
+
+            with self.lock:
+                for nb in self.neighbours.values():
+                    for key, entry in list(nb.pending_acks.items()):
+                        # Skip if retransmission interval not reached
+                        if now - entry["sent_at"] < self.config.rxmt_interval:
+                            continue
+
+                        if entry["retries"] >= self.config.max_retries:
+                            LOG.warning("Max retransmission retires reached for %s, stopping retransmission...", nb.router_id)
+                            del nb.pending_acks[key]
+                            continue
+
+                        LOG.debug("Retransmitting %s to %s...", key, nb.router_id)
+                        self.send_lsupd(nb, [entry["lsa"]], track_ack=False)
+                        entry["sent_at"] = now
+                        entry["retries"] += 1
+            time.sleep(1)
 
     ### ------ OSPF SNIFFER ------ ###
     def start_sniffer(self) -> None:
@@ -252,7 +289,7 @@ self.config.area,
 
         # Otherwise Determine OSPF Packet Type
         with self.lock:
-            nb = self.get_or_create_neighbour(ospf)
+            nb = self.get_or_create_neighbour(pkt)
 
             if ospf.type == OSPFType.HELLO:
                 self.handle_hello(nb, ospf)
@@ -310,10 +347,10 @@ self.config.area,
 
     def should_form_adjacency(self, nb: Neighbour, ospf_hello: OSPF_Hello) -> bool:
         """Form adjacency only if router is DR/BDR"""
-        nb_is_dr = str(ospf_hello.router) == nb.router_id
-        nb_is_bdr = str(ospf_hello.router) == nb.router_id
+        nb_is_dr = str(ospf_hello.router) == nb.ip
+        nb_is_bdr = str(ospf_hello.backup) == nb.ip
         # Initialising - No DR set yet
-        no_dr_declared = str(ospf_hello.router) == nb.router_id
+        no_dr_declared = str(ospf_hello.router) == "0.0.0.0"
 
         return nb_is_dr or nb_is_bdr or no_dr_declared
 
@@ -467,14 +504,13 @@ self.config.area,
 
     def continue_dbd_exchange(self, nb: Neighbour, more: bool) -> None:
         if more:
-            nb_ddseq = typing.cast(int, nb.dd_seq)
-            nb_ddseq += 1
+            nb.dd_seq = typing.cast(int, nb.dd_seq) + 1
 
             dbd_packet = self.build_dbd_packet(
                     master=True,
                     init=False,
                     more=False,
-                    dd_seq=nb_ddseq,
+                    dd_seq=nb.dd_seq,
                     lsa_headers=[],
                     )
             self._send_ospf(nb.ip, typing.cast(str, nb.mac), OSPFType.DBD, dbd_packet)
@@ -548,10 +584,12 @@ self.config.area,
         received_lsas = []
 
         for lsa in lsupd.lsalist:
-            key = (lsa.type, str(lsa.id), str(lsa.adrouter))
+            key = self.lsa_key(lsa)
+            current = self.lsdb.get(key)
 
-            self.lsdb[key] = lsa
-            received_lsas.append(lsa)
+            if current is None or self.is_newer_lsa(lsa, current):
+                self.lsdb[key] = lsa
+                received_lsas.append(lsa)
 
             # Repopulate neighbour_headers list without received key
             nb.neighbour_headers = [
@@ -569,6 +607,16 @@ self.config.area,
 
         if nb.state == NeighbourState.LOADING and not nb.pending_requests:
             self.send_next_lsreq_batch(nb)
+
+    def is_newer_lsa(self, incoming: Any, current: Any) -> bool:
+        """Helper function to determine if incoming LSDB is newer that current"""
+        if incoming.seq != current.seq:
+            return incoming.seq > current.seq
+
+        if incoming.chksum != current.chksum:
+            return incoming.chksum > current.chksum
+
+        return incoming.age < current.age
 
     def send_lsa_ack(self, nb: Neighbour, lsas: list[Any]) -> None:
         """Send LSA Ack"""
@@ -595,6 +643,66 @@ self.config.area,
                 payload=ack,
                 )
 
+    def handle_lsreq(self, nb: Neighbour, ospf: Any) -> None:
+        """Handles neighbour's request for full LSAs"""
+        req = ospf[OSPF_LSReq]
+        lsas_to_send = []
+
+        for item in req.requests:
+            key = self.lsa_key(item)
+            lsa = self.lsdb.get(key)
+
+            if lsa is None:
+                LOG.warning("Neighbour %s requested unknown LSA %s, skipping...", nb.router_id, key)
+                continue
+
+            lsas_to_send.append(lsa)
+
+        if lsas_to_send:
+            self.send_lsupd(nb, lsas_to_send, track_ack=True)
+
+    def handle_lsack(self, nb: Neighbour, ospf: Any) -> None:
+        """Handles Acknowledgement for LSAs sent - Remove entry from pending_ack list"""
+        ack = ospf[OSPF_LSAck]
+
+        for hdr in ack.lsaheaders:
+            key = self.lsa_key(hdr)
+
+            if key in nb.pending_acks:
+                del nb.pending_acks[key]
+                LOG.debug("Neighbour %s acknowledged LSA %s", nb.router_id, key)
+
+    def handle_loading_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: set[str]) -> None:
+        """Handles incoming DBD packets while waiting for requested LSAs"""
+        self.collect_lsa_headers(nb, dbd_packet.lsaheaders)
+
+        if nb.neighbour_headers and not nb.pending_requests:
+            self.send_next_lsreq_batch(nb)
+
+    def send_lsupd(self, nb: Neighbour, lsas: list[Any], track_ack: bool):
+        """Send full LSAs to neighbour"""
+        if nb.mac is None:
+            LOG.warning("Missing MAC, unable to send LSU to %s", nb.router_id)
+            return
+
+        lsu_payload = OSPF_LSUpd(lsalist=lsas)
+
+        self._send_ospf(
+                dst_ip=nb.ip,
+                dst_mac=nb.mac,
+                ospf_type=OSPFType.LSU,
+                payload=lsu_payload,
+                )
+
+        if track_ack:
+            for lsa in lsas:
+                key = self.lsa_key(lsa)
+                nb.pending_acks[key] = {
+                        "lsa": lsa,
+                        "sent_at": time.time(),
+                        "retries": 0,
+                        }
+
     def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
         """Sends OSPF Packets"""
         pkt = (
@@ -612,4 +720,10 @@ self.config.area,
 
         sendp(pkt, iface=self.config.iface, verbose=False)
 
-
+    def lsa_key(self, lsa_or_hdr: Any) -> tuple[int, str, str]:
+        """Small Reusable lsa key helper"""
+        return (
+                int(lsa_or_hdr.type),
+                str(lsa_or_hdr.id),
+                str(lsa_or_hdr.adrouter),
+                )
