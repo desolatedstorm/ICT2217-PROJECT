@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto
 from typing import Any
 
-from scapy.all import Packet, get_if_hwaddr, get_if_addr, sendp, sniff
+from scapy.all import Packet, get_if_hwaddr, get_if_addr, sendp, sniff, conf
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP
 from scapy.contrib.ospf import (
@@ -68,18 +68,18 @@ class DBDFlags(IntEnum):
 @dataclass
 class OSPFConfig:
     iface: str
-    area: str
-    int_ip: str
     router_id: str
+    mask: str
+    area: str = "0.0.0.0"
+    int_ip: str | None = None
     
-    # Auth details TODO: determine if should use hex/bytes/int
-    authtype: int
-    plaintext_pw: str | None
-    key_id: int
-    authdata_len: int
-    seq: int
+    # Auth details 
+    authtype: int | None = None
+    plaintext_pw: str | None = None
+    key_id: int | None = None
+    authdata_len: int | None = None
+    seq: int | None = None
 
-    mask: str = "255.255.255.0"
     hello_interval: int = 10
     dead_interval: int = 40
     priority: int = 0 #NOTE: Priority 0 = DROTHER - not participating in DR/BDR election
@@ -123,12 +123,13 @@ class Neighbour:
 
 # Main Class
 class OSPFSession:
-    def __init__(self, config: OSPFConfig) -> None:
+    def __init__(self, config: OSPFConfig, ip: str, mac: str, path_to_dict: str) -> None:
         self.config = config
+        self.dictpath = path_to_dict
 
         # Device IP and MAC
-        self.src_ip = get_if_addr(config.iface)
-        self.src_mac = get_if_hwaddr(config.iface)
+        self.src_ip = ip
+        self.src_mac = mac
 
         # Track DR/BDR - both starts with "0.0.0.0"
         self.dr = "0.0.0.0"
@@ -780,47 +781,6 @@ self.config.area,
     #                     "retries": 0,
     #                     }
 
-    def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
-        """Sends OSPF Packets"""
-        # TODO: implement authtype checker
-        if self.config.authtype == OSPFAuthType.CRYPTO:
-            ospf_hdr = OSPF_Hdr(
-                    version=2, # OSPF ver 2 for ipv4
-                    type=ospf_type,
-                    src=self.config.router_id,
-                    area=self.config.area,
-                    chksum=0,
-                    authtype=self.config.authtype,
-                    keyid=self.config.key_id,
-                    authdatalen=self.config.authdata_len,
-                    seq=self.config.seq,
-                    )
-        elif self.config.authtype == OSPFAuthType.PLAINTEXT:
-            ospf_hdr = OSPF_Hdr(
-                    version=2,
-                    type=ospf_type,
-                    src=self.config.router_id,
-                    area=self.config.area,
-                    authtype=self.config.authtype,
-                    )
-        else:
-            ospf_hdr = OSPF_Hdr(
-                        version=2,
-                        type=ospf_type,
-                        src=self.config.router_id,
-                        area=self.config.area,
-                        authtype=self.config.authtype,
-                        ) 
-
-        pkt = (
-                Ether(src=self.src_mac, dst=dst_mac) /
-                IP(src=self.src_ip, dst=dst_ip, proto=89, ttl=1) /
-                ospf_hdr /
-                payload
-            )
-
-        sendp(pkt, iface=self.config.iface, verbose=False)
-
     def crack_password(self, ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
         """
         OSPF Authtype 2 - Hashed PW cracker
@@ -877,6 +837,49 @@ self.config.area,
             LOG.error("[!] No permission to open %s", filename)
         except Exception as e:
             LOG.error(f"[!] crack_password - Unknown error: {e}")
+
+    def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
+        """Sends OSPF Packets"""
+        # TODO: Cleanup - alota values same as default, unnecessary
+        if self.config.authtype == OSPFAuthType.CRYPTO:
+            ospf_hdr = OSPF_Hdr(
+                    version=2, # OSPF ver 2 for ipv4
+                    type=ospf_type,
+                    src=self.config.router_id,
+                    area=self.config.area,
+                    chksum=0,
+                    authtype=self.config.authtype,
+                    keyid=self.config.key_id,
+                    authdatalen=self.config.authdata_len,
+                    seq=self.config.seq,
+                    key=self.config.plaintext_pw
+                    )
+        elif self.config.authtype == OSPFAuthType.PLAINTEXT:
+            ospf_hdr = OSPF_Hdr(
+                    version=2,
+                    type=ospf_type,
+                    src=self.config.router_id,
+                    area=self.config.area,
+                    authtype=self.config.authtype,
+                    authdata=self.config.plaintext_pw
+                    )
+        else:
+            ospf_hdr = OSPF_Hdr(
+                        version=2,
+                        type=ospf_type,
+                        src=self.config.router_id,
+                        area=self.config.area,
+                        authtype=self.config.authtype,
+                        ) 
+
+        pkt = (
+                Ether(src=self.src_mac, dst=dst_mac) /
+                IP(src=self.src_ip, dst=dst_ip, proto=89, ttl=1) /
+                ospf_hdr /
+                payload
+            )
+
+        sendp(pkt, iface=self.config.iface, verbose=False)
 
     # def lsa_key(self, lsa_or_hdr: Any) -> tuple[int, str, str]:
     #     """Small Reusable lsa key helper"""
