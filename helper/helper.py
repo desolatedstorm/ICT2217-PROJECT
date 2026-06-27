@@ -1,25 +1,24 @@
 #!/usr/bin/python3
 
 import hashlib
-from requests.compat import bytes
-import typing
 import logging
 import threading
 import time
+import typing
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto
 from typing import Any
 
-from scapy.all import Packet, get_if_hwaddr, get_if_addr, sendp, sniff, conf
-from scapy.layers.l2 import Ether
-from scapy.layers.inet import IP
+from scapy.all import Packet, sendp, sniff
 from scapy.contrib.ospf import (
-        OSPF_Hdr,
-        OSPF_Hello,
-        OSPF_DBDesc,
-        OSPF_LSUpd,
-        OSPF_External_LSA,
-        )
+    OSPF_DBDesc,
+    OSPF_External_LSA,
+    OSPF_Hdr,
+    OSPF_Hello,
+    OSPF_LSUpd,
+)
+from scapy.layers.inet import IP
+from scapy.layers.l2 import Ether
 
 LOG = logging.getLogger("ospf-session")
 

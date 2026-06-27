@@ -14,10 +14,6 @@ from helper.helper import (
         )
 
 
-
-
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("int", help="Network Interface Card to bind to (e.g. eth0)")
