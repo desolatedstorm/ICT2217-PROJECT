@@ -146,6 +146,20 @@ class OSPFSession:
         self.running = False
         self.lock = threading.Lock()
 
+        # self.config.authtype = getattr(ospf, "authtype", 0)
+        # Crypto Authdata PW is the last 16 bytes of the packet
+        # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
+
+        # Impt: Extract password/authdata
+        if extract_details.get("authtype") == OSPFAuthType.PLAINTEXT:
+            # Extract plaintext pw directly
+            extract_details["password"] = ospf_packets.authdata
+
+        self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
+
+        if not self.config.plaintext_pw:
+            return
+
     def run(self):
         self.running = True
 
@@ -259,31 +273,6 @@ self.config.area,
         if ospf.area != self.config.area:
             return
 
-        self.config.authtype = getattr(ospf, "authtype", 0)
-        # Impt: Extract password/authdata
-        if self.config.authtype == OSPFAuthType.PLAINTEXT:
-            # Extract plaintext pw directly
-            self.config.plaintext_pw = ospf.authdata
-        elif self.config.authtype == OSPFAuthType.CRYPTO:
-            # Step 1. Extract keyID, authdatalen, and seq numbers
-            # Step 2. Extract actual authdata (last 16 bytes of entire packet)
-            # Step 3. Run cracker function to extract password (to lock or to not lock, that is the question)
-            # Step 4. Fill self.config.plaintext_pw with cracked value 
-            # Step 5. update _send_ospf func with corresponding details
-            self.config.key_id = getattr(ospf, "keyid", 1)
-            self.config.authdata_len = getattr(ospf, "authdatalen", 0)
-
-            if not hasattr(ospf, "seq"):
-                self.config.authseq = int(time.time()) & 0xFFFFFFFF
-            else:
-                self.config.authseq = (getattr(ospf, "seq", 0) + 1) & 0xFFFFFFFF
-
-            # Crypto Authdata PW is the last 16 bytes of the packet
-            # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
-            self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
-
-            if not self.config.plaintext_pw:
-                return
 
         # Otherwise Determine OSPF Packet Type
         with self.lock:
