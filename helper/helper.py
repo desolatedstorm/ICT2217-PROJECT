@@ -472,9 +472,9 @@ self.config.area,
             return
 
         # Neighbour accepts us as master - confirm ddseq number same as our tracked dd_seq number
-        nb_yeilded = not (flags & DBDFlags.MASTER) and dbd_packet.ddseq == nb.dd_seq
+        nb_yielded = not (flags & DBDFlags.MASTER) and dbd_packet.ddseq == nb.dd_seq
 
-        if nb_yeilded:
+        if nb_yielded:
             nb.is_master = False 
             LOG.debug("We are master")
 
