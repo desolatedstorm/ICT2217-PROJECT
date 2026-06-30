@@ -152,7 +152,7 @@ no shut
 vlan 20
 name <Some name>
 
-int vlan 20
+int g1/0/24
 desc Downlink to ASW2
 switchport mode access 
 switchport access vlan 20
