@@ -97,6 +97,14 @@ network 10.2.24.0 0.0.0.3 area 0
 ## DSW1 Configuration Commands
 
 ```
+en
+
+conf t
+
+hostname DSW1
+
+no ip domain lookup
+
 ip routing
 
 int g1/0/1
@@ -135,6 +143,14 @@ network 192.168.10.0 0.0.0.255 area 0
 ## DSW2 Configuration Commands
 
 ```
+en
+
+conf t
+
+hostname DSW2
+
+no ip domain lookup
+
 ip routing
 
 int g1/0/1
@@ -168,6 +184,14 @@ network 10.1.34.0 0.0.0.3 area 0
 
 ASW1
 ```
+en
+
+conf t
+
+hostname ASW1
+
+no ip domain lookup
+
 vlan 10
 name Staff_VLAN
 
@@ -185,6 +209,25 @@ no shut
 
 ASW2
 ```
+en
+
+conf t
+
+hostname ASW1
+
+no ip domain lookup
+
+vlan 10
+name Staff_VLAN
+
+int g1/0/24
+desc Uplink to DSW1
+
+int range g1/0/1-24
+switchport mode access
+switchport access vlan 10
+no shut
+
 # Same as ASW1 but change desc and vlan 10 to vlan 20
 # Plug victim machine into any interface
 ```
