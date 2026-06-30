@@ -232,6 +232,24 @@ no shut
 # Plug victim machine into any interface
 ```
 
+## Setting up Authentication
+```
+# plaintext
+router ospf [process-id]
+area [area-id] authentication
+exit
+int g1/0/1
+ip ospf authentication-key [password]
+
+# md5
+interface g1/0/1
+ip ospf authtication message-digest
+ip ospf message-digest-key 1 md5 [password]
+
+# only if you configured plantext password previously
+no ip ospf authentication-key [old password]
+```
+
 ## Setting up Hosts
 
 # Route internal NIC to WLAN NIC using IPTABLES
