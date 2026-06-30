@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto, IntFlag
 from typing import Any
 
-from scapy.all import Packet, sendp, sniff
+from scapy.all import Packet, sendp, sniff, raw, Raw
 from scapy.contrib.ospf import (
     OSPF_DBDesc,
     OSPF_External_LSA,
@@ -30,6 +30,25 @@ ALL_SPF_ROUTERS_MAC = "01:00:5e:00:00:05"
 # NOTE: NOT USED
 # ALL_DR_ROUTERS = "224.0.0.6"
 # ALL_DR_ROUTERS_MAC = "01:00:5e:00:00:06"
+
+def hash_password(pw: str, actual_ospf_pkt: bytes):
+
+    pw_bytes = pw.strip().encode('utf-8')
+
+    if (len(pw_bytes) < 16):
+        padded_key = pw_bytes + b'\x00' * (16 - len(pw_bytes)) if len(pw_bytes) < 16 else pw_bytes[:16]
+    else:
+        padded_key = pw_bytes[:16]
+
+    # LOG.debug(f"Length of pw_bytes and length of padded_key: {len(pw_bytes)} : {len(padded_key)}")
+
+    # Concatenate actual ospf pkt and padded key
+    buffer = actual_ospf_pkt + padded_key
+
+    # Calculate hash
+    generated_hash = hashlib.md5(buffer).digest()
+
+    return generated_hash
 
 class OSPFAuthType(IntEnum):
     NONE = 0
@@ -73,12 +92,12 @@ class OSPFConfig:
     mask: str
     int_ip: str
     area: str = "0.0.0.0"
+    plaintext_pw: str = "" # use default val first so it doenst crash
 
     lsa_seq: int = 0x80000001
     
     # Auth details 
     authtype: int | None = None
-    plaintext_pw: str | None = None
     key_id: int | None = None
     authdata_len: int | None = None
     authseq: int | None = None
@@ -128,6 +147,7 @@ class Neighbour:
 class OSPFSession:
     def __init__(self, config: OSPFConfig, ip: str, mac: str, path_to_dict: str) -> None:
         self.config = config
+
         self.dictpath = path_to_dict
 
         # Device IP and MAC
@@ -150,15 +170,15 @@ class OSPFSession:
         # Crypto Authdata PW is the last 16 bytes of the packet
         # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
 
-        # Impt: Extract password/authdata
-        if extract_details.get("authtype") == OSPFAuthType.PLAINTEXT:
-            # Extract plaintext pw directly
-            extract_details["password"] = ospf_packets.authdata
-
-        self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
-
-        if not self.config.plaintext_pw:
-            return
+        # # Impt: Extract password/authdata
+        # if extract_details.get("authtype") == OSPFAuthType.PLAINTEXT:
+        #     # Extract plaintext pw directly
+        #     extract_details["password"] = ospf_packets.authdata
+        #
+        # self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
+        #
+        # if not self.config.plaintext_pw:
+        #     return
 
     def run(self):
         self.running = True
@@ -183,6 +203,8 @@ self.config.area,
 
         try:
             self.start_sniffer()
+        except Exception as e:
+            LOG.error(f"Exception occured while sniffing: {e}")
         finally:
             self.running = False
 
@@ -265,6 +287,7 @@ self.config.area,
 
         ospf = pkt[OSPF_Hdr]
 
+
         # Own OSPF Packet - Drop
         if ospf.src == self.config.router_id:
             return
@@ -273,6 +296,8 @@ self.config.area,
         if ospf.area != self.config.area:
             return
 
+        if ospf.authtype == 2:
+            self.config.authseq = ospf.seq + 1
 
         # Otherwise Determine OSPF Packet Type
         with self.lock:
@@ -635,7 +660,7 @@ self.config.area,
         """Sends and Builds LSAck packets"""
         headers = [
                 OSPF_LSA_Hdr(
-                    age=lsa.age,
+                    age=lsa.age if hasattr(lsa, "age") else 10,
                     options=lsa.options,
                     type=lsa.type,
                     id=lsa.id,
@@ -725,18 +750,48 @@ self.config.area,
         """Sends OSPF Packets"""
         # TODO: Cleanup - alota values same as default, unnecessary
         if self.config.authtype == OSPFAuthType.CRYPTO:
-            ospf_hdr = OSPF_Hdr(
-                    version=2, # OSPF ver 2 for ipv4
-                    type=ospf_type,
-                    src=self.config.router_id,
-                    area=self.config.area,
-                    chksum=0,
-                    authtype=self.config.authtype,
-                    keyid=self.config.key_id,
-                    authdatalen=self.config.authdata_len,
-                    seq=self.config.authseq,
-                    key=self.config.plaintext_pw
-                    )
+
+            ospf = (
+                OSPF_Hdr(
+                        version=2, # OSPF ver 2 for ipv4
+                        type=ospf_type,
+                        src=self.config.router_id,
+                        area=self.config.area,
+                        chksum=0,
+                        authtype=self.config.authtype,
+                        keyid=self.config.key_id,
+                        authdatalen=self.config.authdata_len,
+                        seq=self.config.authseq,
+                        # key=self.config.plaintext_pw
+                        ) /
+                payload
+            )
+
+            ospf_bytes = raw(ospf)
+
+            ospf_len = int.from_bytes(ospf_bytes[2:4], "big")
+
+            ospf_packet = ospf_bytes[:ospf_len] # in bytes
+
+            # Run hashing on stored plaintext password
+            generated_hash = hash_password(self.config.plaintext_pw, ospf_packet)
+
+            LOG.debug(f"generated hash: {generated_hash.hex()}")
+
+            full_ospf_packet = ospf_packet + generated_hash
+
+            pkt = (
+                    Ether(src=self.src_mac, dst=dst_mac) /
+                    IP(src=self.src_ip, dst=dst_ip, proto=89, ttl=1) /
+                    Raw(full_ospf_packet) 
+                )
+
+            
+
+            sendp(pkt, iface=self.config.iface, verbose=False)
+
+            return
+
         elif self.config.authtype == OSPFAuthType.PLAINTEXT:
             ospf_hdr = OSPF_Hdr(
                     version=2,
@@ -748,12 +803,12 @@ self.config.area,
                     )
         else:
             ospf_hdr = OSPF_Hdr(
-                        version=2,
-                        type=ospf_type,
-                        src=self.config.router_id,
-                        area=self.config.area,
-                        authtype=self.config.authtype,
-                        ) 
+                    version=2,
+                    type=ospf_type,
+                    src=self.config.router_id,
+                    area=self.config.area,
+                    authtype=self.config.authtype,
+                    ) 
 
         pkt = (
                 Ether(src=self.src_mac, dst=dst_mac) /
