@@ -234,20 +234,41 @@ no shut
 
 ## Setting up Authentication
 ```
-# plaintext
+# plaintext authentication
 router ospf [process-id]
 area [area-id] authentication
 exit
 int g1/0/1
 ip ospf authentication-key [password]
 
-# md5
+# md5 authentication
 interface g1/0/1
 ip ospf authtication message-digest
 ip ospf message-digest-key 1 md5 [password]
 
-# only if you configured plantext password previously
+## only if you configured plantext password previously
 no ip ospf authentication-key [old password]
+
+# removing plaintext
+int g1/0/1
+no ip ospf authentication-key 
+exit
+router ospf [process-id]
+no area [area-id] authentication
+
+# removing md5 
+int g1/0/1
+no ip ospf authentication message-digest
+no ip ospf message-digest-key 1
+
+## check:
+show running-config | section router ospf
+show ip ospf neighbor
+show ip route ospf
+
+## clear:
+clear ip osfp process
+
 ```
 
 ## Setting up Hosts
