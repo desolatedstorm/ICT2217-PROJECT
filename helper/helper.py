@@ -35,12 +35,11 @@ def hash_password(pw: str, actual_ospf_pkt: bytes):
 
     pw_bytes = pw.strip().encode('utf-8')
 
+    # Format key to exactly 16 bytes
     if (len(pw_bytes) < 16):
         padded_key = pw_bytes + b'\x00' * (16 - len(pw_bytes)) if len(pw_bytes) < 16 else pw_bytes[:16]
     else:
         padded_key = pw_bytes[:16]
-
-    # LOG.debug(f"Length of pw_bytes and length of padded_key: {len(pw_bytes)} : {len(padded_key)}")
 
     # Concatenate actual ospf pkt and padded key
     buffer = actual_ospf_pkt + padded_key
@@ -285,8 +284,13 @@ self.config.area,
         if IP not in pkt or OSPF_Hdr not in pkt:
             return
 
-        ospf = pkt[OSPF_Hdr]
+        original_ospf = pkt[OSPF_Hdr]
 
+        # Extract and Clean OSPF Header - Scapy doesn't parse MD5 auth packets properly
+        ospf_len = original_ospf.len
+        ospf_bytes = bytes(original_ospf)[:ospf_len]
+
+        ospf = OSPF_Hdr(ospf_bytes)
 
         # Own OSPF Packet - Drop
         if ospf.src == self.config.router_id:
@@ -297,6 +301,7 @@ self.config.area,
             return
 
         if ospf.authtype == 2:
+            self.config.key_id = ospf.keyid
             self.config.authseq = ospf.seq + 1
 
         # Otherwise Determine OSPF Packet Type
@@ -660,14 +665,15 @@ self.config.area,
         """Sends and Builds LSAck packets"""
         headers = [
                 OSPF_LSA_Hdr(
-                    age=lsa.age if hasattr(lsa, "age") else 10,
-                    options=lsa.options,
+                    # Commented out means not required for LSAck
+                    # age=lsa.age if hasattr(lsa, "age") else 10,
+                    # options=lsa.options,
                     type=lsa.type,
                     id=lsa.id,
                     adrouter=lsa.adrouter,
-                    seq=lsa.seq,
-                    chksum=lsa.chksum,
-                    len=lsa.len,
+                    # seq=lsa.seq,
+                    # chksum=lsa.chksum,
+                    # len=lsa.len,
                     )
                 for lsa in lsas
                 ]

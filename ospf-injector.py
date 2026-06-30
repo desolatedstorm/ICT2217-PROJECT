@@ -1,5 +1,4 @@
 from typing import Any
-import hashlib
 import secrets
 import typing
 from scapy.contrib.ospf import OSPF_Hdr, OSPF_Hello
@@ -46,11 +45,14 @@ def crack_password(pkt: Any, filename: str) -> str | None:
     if getattr(ospf_pkt, "chksum", None) != 0:
         setattr(ospf_pkt, "chksum", 0)
 
-    raw_pkt = bytes(pkt)
+    # raw_pkt = bytes(pkt)
     ospf_bytes = raw(ospf_pkt)
 
-    # Extract OSPF MD5 hash located at end of entire packet (Scapy [RAW] field)
-    extracted_hash = (ospf_bytes[ospf_len:ospf_len+16]).hex()
+    # Authentication Hash Length - MD5 shld be 16 bytes
+    authhash_len = ospf_pkt.authdatalen
+
+    # Hash is located after OSPF_Hdr + OSPF_Hello
+    extracted_hash = (ospf_bytes[ospf_len:ospf_len + authhash_len]).hex()
     LOG.info("[!] Extracted hash %s", extracted_hash)
 
     # Extract actual OSPF packet
@@ -60,13 +62,7 @@ def crack_password(pkt: Any, filename: str) -> str | None:
     try:
         with open(filename, "r", encoding='utf-8', errors="replace") as file:
             for pw in file:
-                print(f"Trying {pw}", end="\r")
-                # Format key to exactly 16 bytes
-
-                # if pw == "chelsea":
-                if "chelsea" in pw:
-                    LOG.debug(f"PW: {pw} - Calculated hash: {generated_hash}")
-
+                print(f"Trying {pw}", end="\r", flush=True)
                 generated_hash = hash_password(pw, actual_ospf_pkt)
 
                 if generated_hash.hex() == extracted_hash:
